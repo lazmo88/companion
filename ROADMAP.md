@@ -6,7 +6,7 @@
 - [x] **Mobile ribbon layout for chat input** — [#383](https://github.com/The-Vibe-Company/companion/pull/383)
 - [x] **Default bypassPermissions mode** — [#384](https://github.com/The-Vibe-Company/companion/pull/384)
 
-## Applied locally (bun patch, not yet submitted)
+## Applied locally (bun patch on 0.69.0)
 
 - [x] Continue Session page (`/continue` route) — resume external CLI sessions
 - [x] 4-mode permission dropdown (default/accept-edits/yolo/plan)
@@ -14,6 +14,7 @@
 - [x] Session rename via double-click on title
 - [x] Continue Session tab in creation UI
 - [x] Session browser — auto-discover Claude Code sessions from `~/.claude/` on Continue page
+- [x] AI Validation via SDK bridge (`ccsdk.lasse.dev`) — no Anthropic API key needed
 
 ## Planned features
 
@@ -26,5 +27,7 @@
 ## Infrastructure
 
 - [x] Persistent session storage (`COMPANION_SESSION_DIR` in systemd service)
+- [x] AI validation URL override (`COMPANION_AI_VALIDATION_URL` in systemd service)
 - [x] Bun patch workflow for local customizations
 - [x] Git repo with backup on GitHub (`lazmo88/companion` — `openclaw/patch-backup` branch)
+- [ ] Prevent auto-updater from wiping patches (pin version or disable auto-update)

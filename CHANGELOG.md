@@ -2,6 +2,61 @@
 
 All modifications applied via `bun patch`.
 
+## [0.69.0-openclaw.1] — 2026-03-02
+
+### Upgraded from 0.58.2 to 0.69.0
+
+Auto-updater bumped the-companion from 0.58.2 to 0.69.0, wiping all patches. Re-applied and adapted all patches for 0.69.0 compatibility.
+
+#### Breaking changes in 0.69.0
+- Token-based authentication added (token printed in server log)
+- Service now runs from global bun install (`~/.bun/bin/the-companion`)
+- Auto-updater rewrites systemd service file, removing custom env vars
+- UI mode toggle simplified to 2 modes (Agent/Plan) — our 4-mode dropdown overrides this
+
+#### New: AI Validation via SDK Bridge
+- **Files**: `server/ai-validator.ts`, `server/routes/settings-routes.ts`
+- Patched `ai-validator.ts` to use `COMPANION_AI_VALIDATION_URL` env var (defaults to `https://ccsdk.lasse.dev/v1/messages`)
+- API key fallback: uses `"sdk-bridge"` as key when env var is set (no Anthropic API key needed)
+- Patched `settings-routes.ts` to report `anthropicApiKeyConfigured: true` when SDK bridge is active
+- Validation model: `claude-haiku-4-5-20251001`
+
+#### Updated: 4-Mode Dropdown for 0.69.0
+- **Files**: `dist/index.html`
+- Updated MODES array with `match` arrays to handle 0.69.0's new labels ("Agent"→bypassPermissions, "Plan"→plan)
+- Dropdown still provides all 4 modes: Default, Accept Edits, Yolo, Plan
+
+#### Updated: Continue Session Tab for 0.69.0
+- **Files**: `dist/index.html`
+- Updated formRoot selector to handle `max-w-2xl` (was `max-w-5xl` in 0.58.2)
+- Tab injection and session browser confirmed working via Playwright headless tests
+
+#### Session Browser (Continue Session page)
+- **Files**: `server/index.ts`
+- `GET /api/claude-sessions` endpoint — scans `~/.claude/projects/` and `~/.claude/history.jsonl`
+- Returns: `sessionId`, `slug`, `project`, `cwd`, `gitBranch`, `lastActive`, `sizeKB`, `lastInput`
+- Browsable session list with search/filter on Continue Session tab and `/continue` page
+
+### Patched Files (0.69.0)
+
+| File | Changes |
+|------|---------|
+| `dist/index.html` | CSS overrides + JS injection (features 1-2, 5-9, 12) |
+| `server/index.ts` | `/continue` route + `/api/claude-sessions` endpoint (features 3, 12) |
+| `server/routes/fs-routes.ts` | `showHidden` param + `POST /api/fs/mkdir` (features 1-2) |
+| `server/cli-launcher.ts` | Default `bypassPermissions` (feature 4) |
+| `server/ai-validator.ts` | SDK bridge URL + API key fallback (new) |
+| `server/routes/settings-routes.ts` | Report API key configured when SDK bridge active (new) |
+
+### Systemd Service (not in patch)
+
+```
+Environment=COMPANION_SESSION_DIR=/home/openclaw/.openclaw/companion/sessions
+Environment=COMPANION_AI_VALIDATION_URL=https://ccsdk.lasse.dev/v1/messages
+```
+
+---
+
 ## [0.58.2-openclaw.2] — 2026-03-02
 
 ### New
