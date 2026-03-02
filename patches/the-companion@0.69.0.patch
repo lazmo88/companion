@@ -1,3 +1,6 @@
+diff --git a/node_modules/the-companion/.bun-tag-e50add51e3aa118e b/.bun-tag-e50add51e3aa118e
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/index.html b/dist/index.html
 index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a6d8ed027 100644
 --- a/dist/index.html
@@ -617,10 +620,10 @@ index 2bba0c36de3c93ae50ea25e8aabeb5a8f3f24869..e26b00b5c18a6813f315ed86229d5ad6
        isContainerized
        && options.permissionMode === "bypassPermissions"
 diff --git a/server/index.ts b/server/index.ts
-index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f82819f4f6e1 100644
+index b5cee150cb44cd6b1cfc67b6e30506617b12088d..333bafd4c4828d86bbb22ea59e4dd79dc46471ff 100644
 --- a/server/index.ts
 +++ b/server/index.ts
-@@ -128,6 +128,424 @@ const app = new Hono();
+@@ -128,6 +128,432 @@ const app = new Hono();
  app.use("/api/*", cors());
  app.route("/api", createRoutes(launcher, wsBridge, sessionStore, worktreeTracker, terminalManager, prPoller, recorder, cronScheduler, agentExecutor));
  
@@ -861,6 +864,14 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f828
 +    <a class="back" href="/">Back to Companion</a>
 +  </div>
 +  <script>
++    // Auth: read token from localStorage (shared with main SPA) or URL param
++    const _authToken = (new URLSearchParams(location.search)).get('token') || localStorage.getItem('companion_auth_token') || '';
++    function authFetch(url, opts) {
++      opts = opts || {};
++      opts.headers = Object.assign({ 'Authorization': 'Bearer ' + _authToken }, opts.headers || {});
++      return fetch(url, opts);
++    }
++
 +    const fpList = document.getElementById('fp-list');
 +    const fpSelect = document.getElementById('fp-select');
 +    const fpHidden = document.getElementById('fp-hidden');
@@ -908,7 +919,7 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f828
 +      try {
 +        const sh = fpHidden.checked ? '1' : '0';
 +        const url = '/api/fs/list?' + (path ? 'path=' + encodeURIComponent(path) + '&' : '') + 'showHidden=' + sh;
-+        const res = await fetch(url);
++        const res = await authFetch(url);
 +        const data = await res.json();
 +        currentPath = data.path;
 +        cwdInput.value = currentPath;
@@ -935,14 +946,14 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f828
 +      const name = prompt('New folder name:');
 +      if (!name || !name.trim()) return;
 +      const newPath = currentPath + '/' + name.trim();
-+      fetch('/api/fs/mkdir', { method: 'POST', headers: { 'Content-Type': 'application/json' },
++      authFetch('/api/fs/mkdir', { method: 'POST', headers: { 'Content-Type': 'application/json' },
 +        body: JSON.stringify({ path: newPath })
 +      }).then(r => r.json()).then(data => {
 +        if (data.error) { alert('Error: ' + data.error); loadDir(currentPath); }
 +        else loadDir(newPath);
 +      }).catch(() => loadDir(currentPath));
 +    });
-+    fetch('/api/fs/home').then(r => r.json()).then(data => {
++    authFetch('/api/fs/home').then(r => r.json()).then(data => {
 +      loadDir(data.cwd || data.home);
 +    }).catch(() => loadDir(undefined));
 +
@@ -1007,7 +1018,7 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f828
 +    async function loadSessions() {
 +      sbList.innerHTML = '<div class="sb-loading">Loading sessions...</div>';
 +      try {
-+        const res = await fetch('/api/claude-sessions');
++        const res = await authFetch('/api/claude-sessions');
 +        allSessions = await res.json();
 +        renderSessions(sbSearch.value);
 +      } catch (e) { sbList.innerHTML = '<div class="sb-empty">Failed to load sessions</div>'; }
@@ -1025,7 +1036,7 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..565ced07ee88e077e92a86bbdac2f828
 +      try {
 +        const sessionId = document.getElementById('sessionId').value.trim();
 +        const cwd = cwdInput.value.trim() || undefined;
-+        const res = await fetch('/api/sessions/create', {
++        const res = await authFetch('/api/sessions/create', {
 +          method: 'POST', headers: { 'Content-Type': 'application/json' },
 +          body: JSON.stringify({ resumeSessionId: sessionId, cwd }),
 +        });
