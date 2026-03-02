@@ -13,6 +13,7 @@
 - [x] Per-session draft message storage
 - [x] Session rename via double-click on title
 - [x] Continue Session tab in creation UI
+- [x] Session browser — auto-discover Claude Code sessions from `~/.claude/` on Continue page
 
 ## Planned features
 
