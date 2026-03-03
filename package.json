@@ -1,8 +1,8 @@
 {
   "dependencies": {
-    "the-companion": "0.69.0"
+    "the-companion": "0.70.0"
   },
   "patchedDependencies": {
-    "the-companion@0.69.0": "patches/the-companion@0.69.0.patch"
+    "the-companion@0.70.0": "patches/the-companion@0.70.0.patch"
   }
 }
