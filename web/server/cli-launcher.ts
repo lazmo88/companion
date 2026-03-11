@@ -7,6 +7,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Subprocess } from "bun";
 import type { SessionStore } from "./session-store.js";
 import type { BackendType } from "./session-types.js";
@@ -18,6 +19,34 @@ import {
   getLegacyCodexHome,
   resolveCompanionCodexSessionHome,
 } from "./codex-home.js";
+
+/** Whether WebSocket transport is enabled for Codex sessions. */
+function isCodexWsTransportEnabled(): boolean {
+  const val = (process.env.COMPANION_CODEX_TRANSPORT || "ws").toLowerCase();
+  return val === "ws" || val === "websocket";
+}
+
+/** Find a free TCP port in the given range by attempting to listen on each. */
+async function findFreePort(start = 4500, end = 4600): Promise<number> {
+  for (let port = start; port <= end; port++) {
+    try {
+      const server = Bun.listen({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          data() {},
+          open() {},
+          close() {},
+        },
+      });
+      server.stop(true);
+      return port;
+    } catch {
+      // Port in use, try next
+    }
+  }
+  throw new Error(`No free port found in range ${start}-${end}`);
+}
 
 function sanitizeSpawnArgsForLog(args: string[]): string {
   const secretKeyPattern = /(token|key|secret|password)/i;
@@ -36,6 +65,9 @@ function sanitizeSpawnArgsForLog(args: string[]): string {
   }
   return out.join(" ");
 }
+
+const CODEX_WS_PROXY_PATH = fileURLToPath(new URL("./codex-ws-proxy.cjs", import.meta.url));
+const CODEX_CONTAINER_WS_PORT = Number(process.env.COMPANION_CODEX_CONTAINER_WS_PORT || "4502");
 
 export interface SdkSessionInfo {
   sessionId: string;
@@ -71,6 +103,20 @@ export interface SdkSessionInfo {
   cronJobId?: string;
   /** Human-readable name of the cron job that spawned this session */
   cronJobName?: string;
+  /** If session was created from an existing Claude thread/session. */
+  resumeSessionAt?: string;
+  /** Whether the resumed session used --fork-session. */
+  forkSession?: boolean;
+  /** If this session was spawned by an agent */
+  agentId?: string;
+  /** Human-readable name of the agent that spawned this session */
+  agentName?: string;
+
+  // Codex WebSocket transport fields
+  /** Port used for Codex WebSocket transport (host mode). */
+  codexWsPort?: number;
+  /** Full WebSocket URL for the Codex app-server. */
+  codexWsUrl?: string;
 
   // Container fields
   /** Docker container ID when session runs inside a container */
@@ -106,15 +152,23 @@ export interface LaunchOptions {
   containerImage?: string;
   /** Runtime cwd inside the container (typically "/workspace"). */
   containerCwd?: string;
+  /** Start from a specific prior Claude session/thread point. */
+  resumeSessionAt?: string;
+  /** Fork a new Claude session when resuming from prior context. */
+  forkSession?: boolean;
+  /** Optional system prompt to inject into Codex sessions (e.g. Linear context). */
+  systemPrompt?: string;
 }
 
 /**
  * Manages CLI backend processes (Claude Code via --sdk-url WebSocket,
- * or Codex via app-server stdio).
+ * or Codex via app-server stdio/WebSocket).
  */
 export class CliLauncher {
   private sessions = new Map<string, SdkSessionInfo>();
   private processes = new Map<string, Subprocess>();
+  /** Sidecar Node proxy processes used by Codex WebSocket transport. */
+  private codexWsProxies = new Map<string, Subprocess>();
   /** Runtime-only env vars per session (kept out of persisted launcher state). */
   private sessionEnvs = new Map<string, Record<string, string>>();
   private port: number;
@@ -168,20 +222,37 @@ export class CliLauncher {
       if (this.sessions.has(info.sessionId)) continue;
 
       // Check if the process is still alive
-      if (info.pid && info.state !== "exited") {
-        try {
-          process.kill(info.pid, 0); // signal 0 = just check if alive
-          info.state = "starting"; // WS not yet re-established, wait for CLI to reconnect
-          this.sessions.set(info.sessionId, info);
-          recovered++;
-        } catch {
-          // Process is dead
-          info.state = "exited";
-          info.exitCode = -1;
+      if (info.state !== "exited") {
+        if (info.containerId && info.codexWsPort) {
+          // Docker WS mode: the stored PID is `docker exec -d` which exits
+          // immediately after launch.  Check container liveness instead.
+          const containerState = containerManager.isContainerAlive(info.containerId);
+          if (containerState === "running") {
+            info.state = "starting";
+            this.sessions.set(info.sessionId, info);
+            recovered++;
+          } else {
+            info.state = "exited";
+            info.exitCode = -1;
+            this.sessions.set(info.sessionId, info);
+          }
+        } else if (info.pid) {
+          try {
+            process.kill(info.pid, 0); // signal 0 = just check if alive
+            info.state = "starting"; // WS not yet re-established, wait for CLI to reconnect
+            this.sessions.set(info.sessionId, info);
+            recovered++;
+          } catch {
+            // Process is dead
+            info.state = "exited";
+            info.exitCode = -1;
+            this.sessions.set(info.sessionId, info);
+          }
+        } else {
           this.sessions.set(info.sessionId, info);
         }
       } else {
-        // Already exited or no PID
+        // Already exited
         this.sessions.set(info.sessionId, info);
       }
     }
@@ -208,6 +279,11 @@ export class CliLauncher {
       createdAt: Date.now(),
       backendType,
     };
+
+    if (options.resumeSessionAt) {
+      info.resumeSessionAt = options.resumeSessionAt;
+      info.forkSession = options.forkSession === true;
+    }
 
     if (backendType === "codex") {
       info.codexInternetAccess = options.codexInternetAccess === true;
@@ -244,8 +320,21 @@ export class CliLauncher {
     const info = this.sessions.get(sessionId);
     if (!info) return { ok: false, error: "Session not found" };
 
-    // Kill old process if still alive
+    // Kill old process(es) if still alive.
+    // Snapshot both handles first because killing the proxy can trigger the
+    // WS session exit handler, which clears `this.processes`.
     const oldProc = this.processes.get(sessionId);
+    const oldProxy = this.codexWsProxies.get(sessionId);
+    if (oldProxy) {
+      try {
+        oldProxy.kill("SIGTERM");
+        await Promise.race([
+          oldProxy.exited,
+          new Promise((r) => setTimeout(r, 2000)),
+        ]);
+      } catch {}
+      this.codexWsProxies.delete(sessionId);
+    }
     if (oldProc) {
       try {
         oldProc.kill("SIGTERM");
@@ -396,6 +485,8 @@ export class CliLauncher {
       "--print",
       "--output-format", "stream-json",
       "--input-format", "stream-json",
+      // Required on newer Claude Code versions to emit streaming chunk events.
+      "--include-partial-messages",
       "--verbose",
     ];
 
@@ -410,12 +501,19 @@ export class CliLauncher {
         args.push("--allowedTools", tool);
       }
     }
+    if (options.resumeSessionAt) {
+      args.push("--resume-session-at", options.resumeSessionAt);
+    }
+    if (options.forkSession) {
+      args.push("--fork-session");
+    }
 
     // Always pass -p "" for headless mode. When relaunching, also pass --resume
     // to restore the CLI's conversation context.
     if (options.resumeSessionId) {
       args.push("--resume", options.resumeSessionId);
     }
+
     args.push("-p", "");
 
     let spawnCmd: string[];
@@ -505,7 +603,7 @@ export class CliLauncher {
 
   /**
    * Spawn a Codex app-server subprocess for a session.
-   * Unlike Claude Code (which connects back via WebSocket), Codex uses stdio.
+   * Transport (stdio vs WebSocket) is selected by `COMPANION_CODEX_TRANSPORT`.
    */
   private prepareCodexHome(codexHome: string): void {
     mkdirSync(codexHome, { recursive: true });
@@ -536,7 +634,7 @@ export class CliLauncher {
         const src = join(legacyHome, name);
         const dest = join(codexHome, name);
         if (!existsSync(dest) && existsSync(src)) {
-          cpSync(src, dest, { recursive: true });
+          cpSync(src, dest, { recursive: true, dereference: true });
         }
       } catch (e) {
         console.warn(`[cli-launcher] Failed to bootstrap ${name}/ from legacy home:`, e);
@@ -545,6 +643,279 @@ export class CliLauncher {
   }
 
   private spawnCodex(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): void {
+    const useWs = isCodexWsTransportEnabled();
+    if (useWs) {
+      this.spawnCodexWs(sessionId, info, options);
+    } else {
+      this.spawnCodexStdio(sessionId, info, options);
+    }
+  }
+
+  /**
+   * Spawn Codex with WebSocket transport.
+   * Codex listens on `ws://127.0.0.1:PORT`, Companion connects as a client.
+   */
+  private async spawnCodexWs(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): Promise<void> {
+    const isContainerized = !!options.containerId;
+
+    let binary = options.codexBinary || "codex";
+    if (!isContainerized) {
+      const resolved = resolveBinary(binary);
+      if (resolved) {
+        binary = resolved;
+      } else {
+        console.error(`[cli-launcher] Binary "${binary}" not found in PATH`);
+        info.state = "exited";
+        info.exitCode = 127;
+        this.persistState();
+        return;
+      }
+    }
+
+    // Host mode: choose a free host port. Container mode: use a fixed container port
+    // and connect via the container's mapped host port.
+    let codexListenPort: number;
+    let proxyConnectPort: number;
+    if (isContainerized) {
+      codexListenPort = CODEX_CONTAINER_WS_PORT;
+      const containerInfo = containerManager.getContainerById(options.containerId!);
+      const mappedPort = containerInfo?.portMappings.find((p) => p.containerPort === CODEX_CONTAINER_WS_PORT)?.hostPort;
+      if (!mappedPort) {
+        console.error(
+          `[cli-launcher] Missing port mapping for Codex container port ${CODEX_CONTAINER_WS_PORT} ` +
+          `on container ${options.containerId}`,
+        );
+        info.state = "exited";
+        info.exitCode = 1;
+        this.persistState();
+        return;
+      }
+      proxyConnectPort = mappedPort;
+    } else {
+      try {
+        proxyConnectPort = await findFreePort(4500, 4600);
+      } catch (err) {
+        console.error(`[cli-launcher] Failed to find free port for Codex WS: ${err}`);
+        info.state = "exited";
+        info.exitCode = 1;
+        this.persistState();
+        return;
+      }
+      codexListenPort = proxyConnectPort;
+    }
+
+    const listenAddr = isContainerized
+      ? `ws://0.0.0.0:${codexListenPort}`
+      : `ws://127.0.0.1:${codexListenPort}`;
+
+    const args: string[] = ["app-server", "--listen", listenAddr];
+    // Enable Codex multi-agent mode by default (product decision).
+    args.push("--enable", "multi_agent");
+    const internetEnabled = options.codexInternetAccess !== false;
+    args.push("-c", `tools.webSearch=${internetEnabled ? "true" : "false"}`);
+    const codexHome = resolveCompanionCodexSessionHome(
+      sessionId,
+      options.codexHome,
+    );
+    if (!isContainerized) {
+      this.prepareCodexHome(codexHome);
+    }
+
+    let spawnCmd: string[];
+    let spawnEnv: Record<string, string | undefined>;
+    let spawnCwd: string | undefined;
+
+    if (isContainerized) {
+      // Run Codex inside the container via docker exec -d (detached, no stdin pipe needed)
+      const dockerArgs = ["docker", "exec", "-d"];
+      if (options.env) {
+        for (const [k, v] of Object.entries(options.env)) {
+          dockerArgs.push("-e", `${k}=${v}`);
+        }
+      }
+      dockerArgs.push("-e", "CLAUDECODE=");
+      dockerArgs.push("-e", "CODEX_HOME=/root/.codex");
+      dockerArgs.push(options.containerId!);
+      const innerCmd = [binary, ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
+      dockerArgs.push("bash", "-lc", innerCmd);
+
+      spawnCmd = dockerArgs;
+      spawnEnv = { ...process.env, PATH: getEnrichedPath() };
+      spawnCwd = undefined;
+    } else {
+      const binaryDir = resolve(binary, "..");
+      const siblingNode = join(binaryDir, "node");
+      const enrichedPath = getEnrichedPath();
+      const spawnPath = [binaryDir, ...enrichedPath.split(":")].filter(Boolean).join(":");
+
+      if (existsSync(siblingNode)) {
+        let codexScript: string;
+        try {
+          codexScript = realpathSync(binary);
+        } catch {
+          codexScript = binary;
+        }
+        spawnCmd = [siblingNode, codexScript, ...args];
+      } else {
+        spawnCmd = [binary, ...args];
+      }
+
+      spawnEnv = {
+        ...process.env,
+        CLAUDECODE: undefined,
+        ...options.env,
+        CODEX_HOME: codexHome,
+        PATH: spawnPath,
+      };
+      spawnCwd = info.cwd;
+    }
+
+    console.log(
+      `[cli-launcher] Spawning Codex WS session ${sessionId}${isContainerized ? " (container)" : ""}: ` +
+      sanitizeSpawnArgsForLog(spawnCmd),
+    );
+
+    const proc = Bun.spawn(spawnCmd, {
+      cwd: spawnCwd,
+      env: spawnEnv,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    info.pid = proc.pid;
+    this.processes.set(sessionId, proc);
+
+    // Pipe stdout/stderr for debugging (JSON-RPC goes over WebSocket now)
+    this.pipeOutput(sessionId, proc);
+
+    // Store WS metadata
+    const wsUrl = `ws://127.0.0.1:${proxyConnectPort}`;
+    info.codexWsPort = proxyConnectPort;
+    info.codexWsUrl = wsUrl;
+
+    // Connect to Codex app-server through a Node helper process that uses the
+    // `ws` package directly (with perMessageDeflate disabled). This avoids a Bun
+    // runtime compatibility issue where the `ws` client can mis-handle a valid
+    // 101 upgrade response from Codex's Rust WS server.
+    const codexBinaryDir = isContainerized ? undefined : resolve(binary, "..");
+    const proxyNodeCandidate = codexBinaryDir ? join(codexBinaryDir, "node") : undefined;
+    const proxyNode = proxyNodeCandidate && existsSync(proxyNodeCandidate) ? proxyNodeCandidate : "node";
+    const proxyProc = Bun.spawn([proxyNode, CODEX_WS_PROXY_PATH, wsUrl, "10000"], {
+      cwd: info.cwd,
+      env: {
+        ...process.env,
+        PATH: getEnrichedPath(),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    this.codexWsProxies.set(sessionId, proxyProc);
+    // proxy stdout is the JSON-RPC protocol stream (consumed by CodexAdapter).
+    // Only pipe stderr for diagnostics to avoid locking stdout.
+    const proxyStderr = proxyProc.stderr;
+    if (proxyStderr && typeof proxyStderr !== "number") {
+      this.pipeStream(sessionId, proxyStderr, "stderr");
+    }
+
+    // Create CodexAdapter using stdio transport to the proxy process.
+    const adapter = new CodexAdapter(proxyProc, sessionId, {
+      model: options.model,
+      cwd: info.cwd,
+      executionCwd: options.containerId ? (info.containerCwd || "/workspace") : info.cwd,
+      approvalMode: options.permissionMode,
+      threadId: info.cliSessionId,
+      sandbox: options.codexSandbox,
+      recorder: this.recorder ?? undefined,
+      systemPrompt: options.systemPrompt,
+      killProcess: async () => {
+        try {
+          proxyProc.kill("SIGTERM");
+        } catch {}
+        try {
+          proc.kill("SIGTERM");
+        } catch {}
+        await Promise.race([
+          Promise.allSettled([proxyProc.exited, proc.exited]),
+          new Promise((r) => setTimeout(r, 5000)),
+        ]);
+      },
+    });
+
+    // Handle init errors
+    adapter.onInitError((error) => {
+      console.error(`[cli-launcher] Codex WS session ${sessionId} init failed: ${error}`);
+      try { proxyProc.kill("SIGTERM"); } catch {}
+      this.codexWsProxies.delete(sessionId);
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = 1;
+        session.cliSessionId = undefined;
+      }
+      this.persistState();
+    });
+
+    // Notify the WsBridge to attach this adapter
+    if (this.onCodexAdapter) {
+      this.onCodexAdapter(sessionId, adapter);
+    }
+
+    info.state = "connected";
+
+    // Monitor the proxy connection process as the primary transport liveness.
+    // In container mode, `docker exec -d` exits immediately after launching Codex
+    // and must not be treated as the backend process lifetime.
+    let exitHandled = false;
+    const handleWsSessionExit = (exitCode: number | null, source: "proxy" | "codex") => {
+      if (exitHandled) return;
+      exitHandled = true;
+      console.log(`[cli-launcher] Codex WS session ${sessionId} exited via ${source} (code=${exitCode})`);
+
+      // Notify the adapter that the transport is gone so it can clean up
+      // pending promises and stop accepting messages immediately.
+      adapter.handleTransportClose();
+
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = exitCode;
+      }
+      this.processes.delete(sessionId);
+      this.codexWsProxies.delete(sessionId);
+      this.persistState();
+      for (const handler of this.exitHandlers) {
+        try { handler(sessionId, exitCode); } catch {}
+      }
+    };
+
+    proxyProc.exited.then((exitCode) => {
+      handleWsSessionExit(exitCode, "proxy");
+    });
+
+    if (!isContainerized) {
+      proc.exited.then((exitCode) => {
+        handleWsSessionExit(exitCode, "codex");
+      });
+    } else {
+      proc.exited.then((exitCode) => {
+        // `docker exec -d` exits immediately after launch in container WS mode.
+        // Suppress the expected success case to avoid noisy logs; keep non-zero exits.
+        if (exitCode !== 0) {
+          console.warn(`[cli-launcher] Codex WS launcher command for ${sessionId} exited (code=${exitCode})`);
+        }
+      });
+    }
+
+    this.persistState();
+  }
+
+  /**
+   * Spawn Codex with stdio transport (legacy).
+   * Unlike Claude Code (which connects back via WebSocket), Codex uses stdin/stdout.
+   */
+  private spawnCodexStdio(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): void {
     const isContainerized = !!options.containerId;
 
     let binary = options.codexBinary || "codex";
@@ -562,6 +933,8 @@ export class CliLauncher {
     }
 
     const args: string[] = ["app-server"];
+    // Enable Codex multi-agent mode by default (product decision).
+    args.push("--enable", "multi_agent");
     const internetEnabled = options.codexInternetAccess !== false;
     args.push("-c", `tools.webSearch=${internetEnabled ? "true" : "false"}`);
     const codexHome = resolveCompanionCodexSessionHome(
@@ -597,11 +970,6 @@ export class CliLauncher {
       spawnCwd = undefined;
     } else {
       // Host-based spawn — resolve node/shebang issues
-      // The codex binary is a Node.js script with `#!/usr/bin/env node` shebang.
-      // When Bun.spawn executes it, the kernel resolves `node` via /usr/bin/env
-      // which may find the system Node (e.g. v12) instead of the nvm-managed one.
-      // To guarantee the correct Node version, we resolve the `node` binary that
-      // lives alongside `codex` and spawn `node <codex.js>` directly.
       const binaryDir = resolve(binary, "..");
       const siblingNode = join(binaryDir, "node");
       const enrichedPath = getEnrichedPath();
@@ -661,6 +1029,7 @@ export class CliLauncher {
       threadId: info.cliSessionId,
       sandbox: options.codexSandbox,
       recorder: this.recorder ?? undefined,
+      systemPrompt: options.systemPrompt,
     });
 
     // Handle init errors — mark session as exited so UI shows failure.
@@ -686,7 +1055,6 @@ export class CliLauncher {
     info.state = "connected";
 
     // Monitor process exit
-    const spawnedAt = Date.now();
     proc.exited.then((exitCode) => {
       console.log(`[cli-launcher] Codex session ${sessionId} exited (code=${exitCode})`);
       const session = this.sessions.get(sessionId);
@@ -703,7 +1071,6 @@ export class CliLauncher {
 
     this.persistState();
   }
-
 
   /**
    * Mark a session as connected (called when CLI establishes WS connection).
@@ -733,8 +1100,14 @@ export class CliLauncher {
    * Kill a session's CLI process.
    */
   async kill(sessionId: string): Promise<boolean> {
+    const proxy = this.codexWsProxies.get(sessionId);
+    if (proxy) {
+      try { proxy.kill("SIGTERM"); } catch {}
+      this.codexWsProxies.delete(sessionId);
+    }
+
     const proc = this.processes.get(sessionId);
-    if (!proc) return false;
+    if (!proc) return !!proxy;
 
     proc.kill("SIGTERM");
 
@@ -798,6 +1171,7 @@ export class CliLauncher {
   removeSession(sessionId: string) {
     this.sessions.delete(sessionId);
     this.processes.delete(sessionId);
+    this.codexWsProxies.delete(sessionId);
     this.sessionEnvs.delete(sessionId);
     this.persistState();
   }
@@ -811,6 +1185,7 @@ export class CliLauncher {
       if (session.state === "exited") {
         this.sessions.delete(id);
         this.sessionEnvs.delete(id);
+        this.codexWsProxies.delete(id);
         pruned++;
       }
     }

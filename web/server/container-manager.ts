@@ -13,11 +13,17 @@ import { tmpdir } from "node:os";
 // Types
 // ---------------------------------------------------------------------------
 
+export interface ContainerPortSpec {
+  port: number;
+  /** Host IP to bind to (default: 0.0.0.0). Use "127.0.0.1" for localhost-only. */
+  hostIp?: string;
+}
+
 export interface ContainerConfig {
   /** Docker image to use (e.g. "the-companion:latest", "node:22-slim") */
   image: string;
-  /** Container ports to expose (e.g. [3000, 8080]) */
-  ports: number[];
+  /** Container ports to expose (e.g. [3000, 8080] or [{ port: 6080, hostIp: "127.0.0.1" }]) */
+  ports: (number | ContainerPortSpec)[];
   /** Extra volume mounts in "host:container[:opts]" format */
   volumes?: string[];
   /** Extra env vars to inject into the container */
@@ -140,7 +146,8 @@ export class ContainerManager {
     const homedir = process.env.HOME || process.env.USERPROFILE || "/root";
 
     // Validate port numbers
-    for (const port of config.ports) {
+    for (const portSpec of config.ports) {
+      const port = typeof portSpec === "number" ? portSpec : portSpec.port;
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new Error(`Invalid port number: ${port} (must be 1-65535)`);
       }
@@ -181,9 +188,11 @@ export class ContainerManager {
       args.push("-v", `${gitconfigPath}:/companion-host-gitconfig:ro`);
     }
 
-    // Port mappings: -p 0:{containerPort}
-    for (const port of config.ports) {
-      args.push("-p", `0:${port}`);
+    // Port mappings: -p [hostIp:]0:{containerPort}
+    for (const portSpec of config.ports) {
+      const port = typeof portSpec === "number" ? portSpec : portSpec.port;
+      const hostIp = typeof portSpec === "number" ? undefined : portSpec.hostIp;
+      args.push("-p", hostIp ? `${hostIp}:0:${port}` : `0:${port}`);
     }
 
     // Extra volumes
@@ -427,15 +436,85 @@ export class ContainerManager {
     this.seedGitAuth(containerId);
   }
 
+  /**
+   * Run git fetch/checkout/pull inside a running container at /workspace.
+   * Call after copyWorkspaceToContainer + reseedGitAuth so credentials are available.
+   * Fetch and pull failures are non-fatal (warnings), matching host-side behavior.
+   */
+  gitOpsInContainer(
+    containerId: string,
+    opts: {
+      branch: string;
+      currentBranch: string;
+      createBranch?: boolean;
+      defaultBranch?: string;
+    },
+  ): { fetchOk: boolean; checkoutOk: boolean; pullOk: boolean; errors: string[] } {
+    const errors: string[] = [];
+    const branch = shellEscape(opts.branch);
+
+    // 1. git fetch --prune
+    let fetchOk = false;
+    try {
+      this.execInContainer(containerId, [
+        "sh", "-lc", "cd /workspace && git fetch --prune",
+      ]);
+      fetchOk = true;
+    } catch (e) {
+      errors.push(`fetch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // 2. git checkout (only if different branch requested)
+    let checkoutOk = true;
+    if (opts.currentBranch !== opts.branch) {
+      checkoutOk = false;
+      try {
+        this.execInContainer(containerId, [
+          "sh", "-lc", `cd /workspace && git checkout ${branch}`,
+        ]);
+        checkoutOk = true;
+      } catch {
+        if (opts.createBranch) {
+          const base = shellEscape(opts.defaultBranch || "main");
+          try {
+            this.execInContainer(containerId, [
+              "sh", "-lc",
+              `cd /workspace && git checkout -b ${branch} origin/${base} 2>/dev/null || git checkout -b ${branch} ${base}`,
+            ]);
+            checkoutOk = true;
+          } catch (e2) {
+            errors.push(`checkout-create: ${e2 instanceof Error ? e2.message : String(e2)}`);
+          }
+        } else {
+          errors.push(`checkout: branch "${opts.branch}" does not exist`);
+        }
+      }
+    }
+
+    // 3. git pull
+    let pullOk = false;
+    try {
+      this.execInContainer(containerId, [
+        "sh", "-lc", "cd /workspace && git pull",
+      ]);
+      pullOk = true;
+    } catch (e) {
+      errors.push(`pull: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    return { fetchOk, checkoutOk, pullOk, errors };
+  }
+
   /** Parse `docker port` output to get host port mappings. */
-  private resolvePortMappings(containerId: string, ports: number[]): PortMapping[] {
+  private resolvePortMappings(containerId: string, ports: (number | ContainerPortSpec)[]): PortMapping[] {
     const mappings: PortMapping[] = [];
-    for (const containerPort of ports) {
+    for (const portSpec of ports) {
+      const containerPort = typeof portSpec === "number" ? portSpec : portSpec.port;
       try {
         const raw = exec(
           `docker port ${shellEscape(containerId)} ${containerPort}`,
         );
-        // Output like "0.0.0.0:49152" or "[::]:49152"
+        // Output like "0.0.0.0:49152" or "127.0.0.1:49152" or "[::]:49152"
         const match = raw.match(/:(\d+)$/m);
         if (match) {
           mappings.push({
@@ -605,6 +684,14 @@ export class ContainerManager {
   /** Get container info for a session. */
   getContainer(sessionId: string): ContainerInfo | undefined {
     return this.containers.get(sessionId);
+  }
+
+  /** Get container info by Docker container ID. */
+  getContainerById(containerId: string): ContainerInfo | undefined {
+    for (const info of this.containers.values()) {
+      if (info.containerId === containerId) return info;
+    }
+    return undefined;
   }
 
   /** List all tracked containers. */

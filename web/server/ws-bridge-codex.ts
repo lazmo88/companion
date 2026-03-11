@@ -1,10 +1,14 @@
 import type {
   BrowserIncomingMessage,
   BrowserOutgoingMessage,
+  PermissionRequest,
   SessionState,
 } from "./session-types.js";
 import type { CodexAdapter } from "./codex-adapter.js";
 import type { Session } from "./ws-bridge-types.js";
+import { validatePermission } from "./ai-validator.js";
+import { getSettings } from "./settings-manager.js";
+import { getEffectiveAiValidation } from "./ai-validation-settings.js";
 
 export interface CodexAttachDeps {
   persistSession: (session: Session) => void;
@@ -16,6 +20,12 @@ export interface CodexAttachDeps {
   onCLISessionId: ((sessionId: string, cliSessionId: string) => void) | null;
   onFirstTurnCompleted: ((sessionId: string, firstUserMessage: string) => void) | null;
   autoNamingAttempted: Set<string>;
+  /** Per-session listeners for assistant messages (used by chat relay). */
+  assistantMessageListeners: Map<string, Set<(msg: BrowserIncomingMessage) => void>>;
+  /** Per-session listeners for result messages (used by chat relay). */
+  resultListeners: Map<string, Set<(msg: BrowserIncomingMessage) => void>>;
+  /** Callback to request auto-relaunch when the backend dies while browsers are connected. */
+  onCLIRelaunchNeeded: ((sessionId: string) => void) | null;
 }
 
 export function attachCodexAdapterHandlers(
@@ -26,11 +36,27 @@ export function attachCodexAdapterHandlers(
 ): void {
   adapter.onBrowserMessage((msg) => {
     if (msg.type === "session_init") {
-      session.state = { ...session.state, ...msg.session, backend_type: "codex" };
+      // Preserve pre-populated commands/skills when adapter sends empty arrays
+      // (Codex does not provide its own commands/skills)
+      const { slash_commands, skills, ...rest } = msg.session;
+      session.state = {
+        ...session.state,
+        ...rest,
+        ...(slash_commands?.length ? { slash_commands } : {}),
+        ...(skills?.length ? { skills } : {}),
+        backend_type: "codex",
+      };
       deps.refreshGitInfo(session, { notifyPoller: true });
       deps.persistSession(session);
     } else if (msg.type === "session_update") {
-      session.state = { ...session.state, ...msg.session, backend_type: "codex" };
+      const { slash_commands, skills, ...rest } = msg.session;
+      session.state = {
+        ...session.state,
+        ...rest,
+        ...(slash_commands?.length ? { slash_commands } : {}),
+        ...(skills?.length ? { skills } : {}),
+        backend_type: "codex",
+      };
       deps.refreshGitInfo(session, { notifyPoller: true });
       deps.persistSession(session);
     } else if (msg.type === "status_change") {
@@ -39,11 +65,22 @@ export function attachCodexAdapterHandlers(
     }
 
     if (msg.type === "assistant") {
-      session.messageHistory.push({ ...msg, timestamp: msg.timestamp || Date.now() });
+      const assistantMsg = { ...msg, timestamp: msg.timestamp || Date.now() };
+      session.messageHistory.push(assistantMsg);
       deps.persistSession(session);
+      // Invoke per-session listeners for chat relay
+      deps.assistantMessageListeners.get(sessionId)?.forEach((cb) => {
+        try { cb(assistantMsg); } catch (err) { console.error("[ws-bridge-codex] Assistant listener error:", err); }
+      });
     } else if (msg.type === "result") {
       session.messageHistory.push(msg);
       deps.persistSession(session);
+      // Invoke per-session listeners for chat relay
+      deps.resultListeners.get(sessionId)?.forEach((cb) => {
+        try {
+          Promise.resolve(cb(msg)).catch((err) => console.error("[ws-bridge-codex] Async result listener error:", err));
+        } catch (err) { console.error("[ws-bridge-codex] Result listener error:", err); }
+      });
     }
 
     if (msg.type === "assistant") {
@@ -55,7 +92,28 @@ export function attachCodexAdapterHandlers(
     }
 
     if (msg.type === "permission_request") {
-      session.pendingPermissions.set(msg.request.request_id, msg.request);
+      const perm = msg.request;
+
+      // AI Validation Mode for Codex sessions
+      const aiSettings = getEffectiveAiValidation(session.state);
+      if (
+        aiSettings.enabled
+        && aiSettings.anthropicApiKey
+        && perm.tool_name !== "AskUserQuestion"
+        && perm.tool_name !== "ExitPlanMode"
+      ) {
+        // Run AI validation async — don't broadcast yet
+        handleCodexAiValidation(session, adapter, perm, deps).catch((err) => {
+          console.warn(`[ws-bridge-codex] AI validation error for tool=${perm.tool_name} request_id=${perm.request_id} session=${session.id}, falling through to manual:`, err);
+          // On error, fall through to normal flow
+          session.pendingPermissions.set(perm.request_id, perm);
+          deps.persistSession(session);
+          deps.broadcastToBrowsers(session, msg);
+        });
+        return;
+      }
+
+      session.pendingPermissions.set(perm.request_id, perm);
       deps.persistSession(session);
     }
 
@@ -87,6 +145,13 @@ export function attachCodexAdapterHandlers(
   });
 
   adapter.onDisconnect(() => {
+    // Guard: only clear the adapter reference if THIS adapter is still the active
+    // one.  During relaunch, a NEW adapter is attached before the OLD one fires
+    // its disconnect callback — without this check the new adapter gets nulled out.
+    if (session.codexAdapter !== adapter) {
+      console.log(`[ws-bridge] Ignoring stale disconnect for session ${sessionId} (adapter replaced)`);
+      return;
+    }
     for (const [reqId] of session.pendingPermissions) {
       deps.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
     }
@@ -95,6 +160,13 @@ export function attachCodexAdapterHandlers(
     deps.persistSession(session);
     console.log(`[ws-bridge] Codex adapter disconnected for session ${sessionId}`);
     deps.broadcastToBrowsers(session, { type: "cli_disconnected" });
+
+    // Auto-relaunch if browsers are still connected (don't leave users staring
+    // at a dead session when the transport drops mid-conversation).
+    if (session.browserSockets.size > 0 && deps.onCLIRelaunchNeeded) {
+      console.log(`[ws-bridge] Auto-relaunching Codex for session ${sessionId} (${session.browserSockets.size} browser(s) connected)`);
+      deps.onCLIRelaunchNeeded(sessionId);
+    }
   });
 
   if (session.pendingMessages.length > 0) {
@@ -112,4 +184,64 @@ export function attachCodexAdapterHandlers(
 
   deps.broadcastToBrowsers(session, { type: "cli_connected" });
   console.log(`[ws-bridge] Codex adapter attached for session ${sessionId}`);
+}
+
+async function handleCodexAiValidation(
+  session: Session,
+  adapter: CodexAdapter,
+  perm: PermissionRequest,
+  deps: CodexAttachDeps,
+): Promise<void> {
+  const aiSettings = getEffectiveAiValidation(session.state);
+  const result = await validatePermission(
+    perm.tool_name,
+    perm.input,
+    perm.description,
+  );
+
+  perm.ai_validation = {
+    verdict: result.verdict,
+    reason: result.reason,
+    ruleBasedOnly: result.ruleBasedOnly,
+  };
+
+  // Auto-approve safe tools
+  if (result.verdict === "safe" && aiSettings.autoApprove) {
+    deps.broadcastToBrowsers(session, {
+      type: "permission_auto_resolved",
+      request: perm,
+      behavior: "allow",
+      reason: result.reason,
+    });
+    adapter.sendBrowserMessage({
+      type: "permission_response",
+      request_id: perm.request_id,
+      behavior: "allow",
+    });
+    return;
+  }
+
+  // Auto-deny dangerous tools
+  if (result.verdict === "dangerous" && aiSettings.autoDeny) {
+    deps.broadcastToBrowsers(session, {
+      type: "permission_auto_resolved",
+      request: perm,
+      behavior: "deny",
+      reason: result.reason,
+    });
+    adapter.sendBrowserMessage({
+      type: "permission_response",
+      request_id: perm.request_id,
+      behavior: "deny",
+    });
+    return;
+  }
+
+  // Uncertain or auto-action disabled: fall through to manual
+  session.pendingPermissions.set(perm.request_id, perm);
+  deps.persistSession(session);
+  deps.broadcastToBrowsers(session, {
+    type: "permission_request",
+    request: perm,
+  });
 }

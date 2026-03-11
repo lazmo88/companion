@@ -1,8 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import type {
   CLIMessage,
-  CLISystemInitMessage,
-  CLISystemStatusMessage,
+  CLISystemMessage,
   CLIAssistantMessage,
   CLIResultMessage,
   CLIStreamEventMessage,
@@ -15,6 +14,7 @@ import type {
   SessionState,
   PermissionRequest,
   BackendType,
+  McpServerConfig,
 } from "./session-types.js";
 import type { SessionStore } from "./session-store.js";
 import type { CodexAdapter } from "./codex-adapter.js";
@@ -40,6 +40,7 @@ import {
   handleInterrupt,
   handleSetModel,
   handleSetPermissionMode,
+  handleSetAiValidation,
   handleControlResponse,
   sendControlRequest,
   handleMcpGetStatus,
@@ -52,12 +53,22 @@ import {
   handleSessionAck,
   handlePermissionResponse,
 } from "./ws-bridge-browser.js";
+import { validatePermission } from "./ai-validator.js";
+import { getSettings } from "./settings-manager.js";
+import { getEffectiveAiValidation } from "./ai-validation-settings.js";
 
 // ─── Bridge ───────────────────────────────────────────────────────────────────
 
 export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
+  private static readonly MESSAGE_HISTORY_LIMIT = 2000; // cap conversation history per session
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
+  private static readonly CLI_DEDUP_WINDOW = 2000; // track last N CLI message hashes (includes stream_events)
+  private static readonly DISCONNECT_DEBOUNCE_MS = Number(
+    process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000",
+  );
+  private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private idleKillTimers = new Map<string, ReturnType<typeof setInterval>>();
   private static readonly IDEMPOTENT_BROWSER_MESSAGE_TYPES = new Set<string>([
     "user_message",
     "permission_response",
@@ -68,6 +79,7 @@ export class WsBridge {
     "mcp_toggle",
     "mcp_reconnect",
     "mcp_set_servers",
+    "set_ai_validation",
   ]);
   private sessions = new Map<string, Session>();
   private store: SessionStore | null = null;
@@ -75,9 +87,12 @@ export class WsBridge {
   private onCLISessionId: ((sessionId: string, cliSessionId: string) => void) | null = null;
   private onCLIRelaunchNeeded: ((sessionId: string) => void) | null = null;
   private onFirstTurnCompleted: ((sessionId: string, firstUserMessage: string) => void) | null = null;
+  private onIdleKill: ((sessionId: string) => void) | null = null;
   private autoNamingAttempted = new Set<string>();
   private userMsgCounter = 0;
   private onGitInfoReady: ((sessionId: string, cwd: string, branch: string) => void) | null = null;
+  private assistantMessageListeners = new Map<string, Set<(msg: BrowserIncomingMessage) => void>>();
+  private resultListeners = new Map<string, Set<(msg: BrowserIncomingMessage) => void>>();
   private static readonly GIT_SESSION_KEYS: GitSessionKey[] = [
     "git_branch",
     "is_worktree",
@@ -102,9 +117,32 @@ export class WsBridge {
     this.onFirstTurnCompleted = cb;
   }
 
+  /** Register a callback for when a CLI should be killed due to idle + no browsers. */
+  onIdleKillCallback(cb: (sessionId: string) => void): void {
+    this.onIdleKill = cb;
+  }
+
   /** Register a callback for when git info is resolved and branch is known. */
   onSessionGitInfoReadyCallback(cb: (sessionId: string, cwd: string, branch: string) => void): void {
     this.onGitInfoReady = cb;
+  }
+
+  /** Subscribe to assistant messages for a specific session (for chat relay). Returns unsubscribe fn. */
+  onAssistantMessageForSession(sessionId: string, cb: (msg: BrowserIncomingMessage) => void): () => void {
+    if (!this.assistantMessageListeners.has(sessionId)) {
+      this.assistantMessageListeners.set(sessionId, new Set());
+    }
+    this.assistantMessageListeners.get(sessionId)!.add(cb);
+    return () => { this.assistantMessageListeners.get(sessionId)?.delete(cb); };
+  }
+
+  /** Subscribe to result (turn completion) for a specific session. Returns unsubscribe fn. */
+  onResultForSession(sessionId: string, cb: (msg: BrowserIncomingMessage) => void): () => void {
+    if (!this.resultListeners.has(sessionId)) {
+      this.resultListeners.set(sessionId, new Set());
+    }
+    this.resultListeners.get(sessionId)!.add(cb);
+    return () => { this.resultListeners.get(sessionId)?.delete(cb); };
   }
 
   /**
@@ -116,6 +154,28 @@ export class WsBridge {
     const session = this.getOrCreateSession(sessionId);
     session.state.is_containerized = true;
     session.state.cwd = hostCwd;
+  }
+
+  /**
+   * Pre-populate slash_commands and skills on a session so they are
+   * available to browsers immediately (before system.init from the CLI).
+   * If system.init arrives later, it overwrites these with the CLI's
+   * authoritative list (see handleSystemMessage).
+   */
+  prePopulateCommands(sessionId: string, slashCommands: string[], skills: string[]): void {
+    const session = this.getOrCreateSession(sessionId);
+    let changed = false;
+    if (session.state.slash_commands.length === 0 && slashCommands.length > 0) {
+      session.state.slash_commands = slashCommands;
+      changed = true;
+    }
+    if (session.state.skills.length === 0 && skills.length > 0) {
+      session.state.skills = skills;
+      changed = true;
+    }
+    if (changed && session.browserSockets.size > 0) {
+      this.broadcastToBrowsers(session, { type: "session_init", session: session.state });
+    }
   }
 
   /** Push a message to all connected browsers for a session (public, for PRPoller etc.). */
@@ -160,6 +220,9 @@ export class WsBridge {
         processedClientMessageIdSet: new Set(
           Array.isArray(p.processedClientMessageIds) ? p.processedClientMessageIds : [],
         ),
+        recentCLIMessageHashes: [],
+        recentCLIMessageHashSet: new Set(),
+        lastCliActivityTs: Date.now(),
       };
       session.state.backend_type = session.backendType;
       // Resolve git info for restored sessions (may have been persisted without it)
@@ -260,6 +323,9 @@ export class WsBridge {
         lastAckSeq: 0,
         processedClientMessageIds: [],
         processedClientMessageIdSet: new Set(),
+        recentCLIMessageHashes: [],
+        recentCLIMessageHashSet: new Set(),
+        lastCliActivityTs: Date.now(),
       };
       this.sessions.set(sessionId, session);
     } else if (backendType) {
@@ -279,6 +345,17 @@ export class WsBridge {
     return Array.from(this.sessions.values()).map((s) => s.state);
   }
 
+  /** Return per-session memory stats for diagnostics. */
+  getSessionMemoryStats(): { id: string; browsers: number; historyLen: number; eventBufferLen: number; pendingMsgs: number }[] {
+    return Array.from(this.sessions.values()).map((s) => ({
+      id: s.id,
+      browsers: s.browserSockets.size,
+      historyLen: s.messageHistory.length,
+      eventBufferLen: s.eventBuffer.length,
+      pendingMsgs: s.pendingMessages.length,
+    }));
+  }
+
   getCodexRateLimits(sessionId: string) {
     const session = this.sessions.get(sessionId);
     return session?.codexAdapter?.getRateLimits() ?? null;
@@ -294,8 +371,12 @@ export class WsBridge {
   }
 
   removeSession(sessionId: string) {
+    this.cancelDisconnectTimer(sessionId);
+    this.stopIdleKillWatchdog(sessionId);
     this.sessions.delete(sessionId);
     this.autoNamingAttempted.delete(sessionId);
+    this.assistantMessageListeners.delete(sessionId);
+    this.resultListeners.delete(sessionId);
     this.store?.remove(sessionId);
   }
 
@@ -303,6 +384,8 @@ export class WsBridge {
    * Close all sockets (CLI + browsers) for a session and remove it.
    */
   closeSession(sessionId: string) {
+    this.cancelDisconnectTimer(sessionId);
+    this.stopIdleKillWatchdog(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -326,6 +409,8 @@ export class WsBridge {
 
     this.sessions.delete(sessionId);
     this.autoNamingAttempted.delete(sessionId);
+    this.assistantMessageListeners.delete(sessionId);
+    this.resultListeners.delete(sessionId);
     this.store?.remove(sessionId);
   }
 
@@ -348,7 +433,19 @@ export class WsBridge {
       onCLISessionId: this.onCLISessionId,
       onFirstTurnCompleted: this.onFirstTurnCompleted,
       autoNamingAttempted: this.autoNamingAttempted,
+      assistantMessageListeners: this.assistantMessageListeners,
+      resultListeners: this.resultListeners,
+      onCLIRelaunchNeeded: this.onCLIRelaunchNeeded,
     });
+  }
+
+  /** Cancel a pending disconnect debounce timer for a session, if any. */
+  private cancelDisconnectTimer(sessionId: string): boolean {
+    const timer = this.disconnectTimers.get(sessionId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this.disconnectTimers.delete(sessionId);
+    return true;
   }
 
   // ── CLI WebSocket handlers ──────────────────────────────────────────────
@@ -356,7 +453,12 @@ export class WsBridge {
   handleCLIOpen(ws: ServerWebSocket<SocketData>, sessionId: string) {
     const session = this.getOrCreateSession(sessionId);
     session.cliSocket = ws;
-    console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
+    // Cancel any pending disconnect debounce timer — CLI reconnected in time
+    if (this.cancelDisconnectTimer(sessionId)) {
+      console.log(`[ws-bridge] CLI reconnected for ${sessionId} (disconnect debounce cancelled)`);
+    } else {
+      console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
+    }
     this.broadcastToBrowsers(session, { type: "cli_connected" });
 
     // Flush any messages queued while waiting for the CLI WebSocket.
@@ -392,6 +494,36 @@ export class WsBridge {
         console.warn(`[ws-bridge] Failed to parse CLI message: ${line.substring(0, 200)}`);
         continue;
       }
+
+      // Deduplicate CLI messages: on WS reconnect, CLI replays in-flight messages.
+      // Use a rolling hash set (like browser-side processedClientMessageIds).
+      // Dedup assistant/result/system by content hash, and stream_event by uuid.
+      // stream_events are the bulk of replay traffic (~1000 per turn) and each
+      // carries a stable uuid that persists across reconnection replays.
+      if (msg.type === "assistant" || msg.type === "result" || msg.type === "system") {
+        const hash = Bun.hash(line).toString(36);
+        if (session.recentCLIMessageHashSet.has(hash)) {
+          continue; // skip duplicate
+        }
+        session.recentCLIMessageHashes.push(hash);
+        session.recentCLIMessageHashSet.add(hash);
+        // Evict oldest entries beyond window
+        while (session.recentCLIMessageHashes.length > WsBridge.CLI_DEDUP_WINDOW) {
+          const old = session.recentCLIMessageHashes.shift()!;
+          session.recentCLIMessageHashSet.delete(old);
+        }
+      } else if (msg.type === "stream_event" && msg.uuid) {
+        if (session.recentCLIMessageHashSet.has(msg.uuid)) {
+          continue; // skip duplicate stream_event
+        }
+        session.recentCLIMessageHashes.push(msg.uuid);
+        session.recentCLIMessageHashSet.add(msg.uuid);
+        while (session.recentCLIMessageHashes.length > WsBridge.CLI_DEDUP_WINDOW) {
+          const old = session.recentCLIMessageHashes.shift()!;
+          session.recentCLIMessageHashSet.delete(old);
+        }
+      }
+
       this.routeCLIMessage(session, msg);
     }
   }
@@ -401,15 +533,30 @@ export class WsBridge {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    session.cliSocket = null;
-    console.log(`[ws-bridge] CLI disconnected for session ${sessionId}`);
-    this.broadcastToBrowsers(session, { type: "cli_disconnected" });
-
-    // Cancel any pending permission requests
-    for (const [reqId] of session.pendingPermissions) {
-      this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
+    // Guard: ignore close events from stale sockets (new WS opened before old closed)
+    if (session.cliSocket !== ws) {
+      console.log(`[ws-bridge] Stale CLI WS closed for ${sessionId}, ignoring`);
+      return;
     }
-    session.pendingPermissions.clear();
+    session.cliSocket = null;
+
+    // Debounce: delay disconnect notification by 15s.
+    // CLI cycles its WebSocket every ~30s (close code 1000) and uses exponential
+    // backoff (1s → 2s → 4s → 8s → …) on reconnect. After rapid successive
+    // disconnects, the backoff can exceed 5s, so we use 15s to cover the worst
+    // case (8s backoff + connection overhead).
+    const existing = this.disconnectTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    this.disconnectTimers.set(sessionId, setTimeout(() => {
+      this.disconnectTimers.delete(sessionId);
+      if (session.cliSocket) return; // CLI reconnected during grace period
+      console.log(`[ws-bridge] CLI disconnect confirmed for ${sessionId}`);
+      this.broadcastToBrowsers(session, { type: "cli_disconnected" });
+      for (const [reqId] of session.pendingPermissions) {
+        this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
+      }
+      session.pendingPermissions.clear();
+    }, WsBridge.DISCONNECT_DEBOUNCE_MS));
   }
 
   // ── Browser WebSocket handlers ──────────────────────────────────────────
@@ -421,6 +568,9 @@ export class WsBridge {
     browserData.lastAckSeq = 0;
     session.browserSockets.add(ws);
     console.log(`[ws-bridge] Browser connected for session ${sessionId} (${session.browserSockets.size} browsers)`);
+
+    // Cancel idle kill watchdog — a browser is back
+    this.stopIdleKillWatchdog(sessionId);
 
     // Refresh git state on browser connect so branch changes made mid-session are reflected.
     this.refreshGitInfo(session, { notifyPoller: true });
@@ -453,7 +603,9 @@ export class WsBridge {
       ? !!session.codexAdapter
       : !!session.cliSocket;
 
-    if (!backendConnected) {
+    if (!backendConnected && !this.disconnectTimers.has(sessionId)) {
+      // Only signal disconnection if we're not within the debounce window
+      // (CLI may be mid-reconnect — avoid UI flap and spurious relaunch)
       this.sendToBrowser(ws, { type: "cli_disconnected" });
       if (this.onCLIRelaunchNeeded) {
         console.log(`[ws-bridge] Browser connected but backend is dead for session ${sessionId}, requesting relaunch`);
@@ -483,7 +635,7 @@ export class WsBridge {
   }
 
   /** Send a user message into a session programmatically (no browser required).
-   *  Used by the cron scheduler to send prompts to autonomous sessions. */
+   *  Used by the cron scheduler and agent executor to send prompts to autonomous sessions. */
   injectUserMessage(sessionId: string, content: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -493,6 +645,33 @@ export class WsBridge {
     this.routeBrowserMessage(session, { type: "user_message", content });
   }
 
+  /** Configure MCP servers on a session programmatically (no browser required).
+   *  Used by the agent executor to set up MCP servers after CLI connects. */
+  injectMcpSetServers(sessionId: string, servers: Record<string, McpServerConfig>): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      console.error(`[ws-bridge] Cannot inject MCP servers: session ${sessionId} not found`);
+      return;
+    }
+    this.routeBrowserMessage(session, { type: "mcp_set_servers", servers });
+  }
+
+  /** Send an initialize control request with context appended to the system prompt.
+   *  Must be called before the first user message. If CLI isn't connected yet,
+   *  the message is queued and sent when CLI connects (before any queued user messages). */
+  injectSystemPrompt(sessionId: string, appendSystemPrompt: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      console.error(`[ws-bridge] Cannot inject system prompt: session ${sessionId} not found`);
+      return;
+    }
+    sendControlRequest(
+      session,
+      { subtype: "initialize", appendSystemPrompt },
+      this.sendToCLI.bind(this),
+    );
+  }
+
   handleBrowserClose(ws: ServerWebSocket<SocketData>) {
     const sessionId = (ws.data as BrowserSocketData).sessionId;
     const session = this.sessions.get(sessionId);
@@ -500,11 +679,79 @@ export class WsBridge {
 
     session.browserSockets.delete(ws);
     console.log(`[ws-bridge] Browser disconnected for session ${sessionId} (${session.browserSockets.size} browsers)`);
+
+    // Start idle kill watchdog when last browser disconnects
+    if (session.browserSockets.size === 0 && !this.idleKillTimers.has(sessionId)) {
+      this.startIdleKillWatchdog(sessionId);
+    }
+  }
+
+  // ── Idle kill watchdog ─────────────────────────────────────────────────
+
+  private static readonly IDLE_KILL_THRESHOLD_MS = Number(
+    process.env.COMPANION_IDLE_KILL_MINUTES
+      ? Number(process.env.COMPANION_IDLE_KILL_MINUTES) * 60_000
+      : 20 * 60_000, // 20 minutes default
+  );
+  private static readonly IDLE_CHECK_INTERVAL_MS = 60_000; // check every 60s
+
+  private startIdleKillWatchdog(sessionId: string) {
+    // Reset activity timestamp so we measure from when browsers left, not from
+    // last CLI message (which may have been seconds ago during active work)
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.lastCliActivityTs = Date.now();
+    }
+    console.log(`[ws-bridge] Starting idle kill watchdog for ${sessionId} (threshold: ${WsBridge.IDLE_KILL_THRESHOLD_MS / 60_000}min)`);
+    const timer = setInterval(() => {
+      this.checkIdleKill(sessionId);
+    }, WsBridge.IDLE_CHECK_INTERVAL_MS);
+    this.idleKillTimers.set(sessionId, timer);
+  }
+
+  private stopIdleKillWatchdog(sessionId: string) {
+    const timer = this.idleKillTimers.get(sessionId);
+    if (timer) {
+      clearInterval(timer);
+      this.idleKillTimers.delete(sessionId);
+      console.log(`[ws-bridge] Cancelled idle kill watchdog for ${sessionId} (browser reconnected)`);
+    }
+  }
+
+  private checkIdleKill(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      this.stopIdleKillWatchdog(sessionId);
+      return;
+    }
+
+    // Browser reconnected — cancel
+    if (session.browserSockets.size > 0) {
+      this.stopIdleKillWatchdog(sessionId);
+      return;
+    }
+
+    const idleMs = Date.now() - session.lastCliActivityTs;
+    if (idleMs < WsBridge.IDLE_KILL_THRESHOLD_MS) {
+      return; // still active or not idle long enough
+    }
+
+    // Truly idle with no browsers — kill
+    console.log(`[ws-bridge] Idle kill triggered for ${sessionId} (idle ${Math.round(idleMs / 60_000)}min, 0 browsers)`);
+    this.stopIdleKillWatchdog(sessionId);
+    if (this.onIdleKill) {
+      this.onIdleKill(sessionId);
+    }
   }
 
   // ── CLI message routing ─────────────────────────────────────────────────
 
   private routeCLIMessage(session: Session, msg: CLIMessage) {
+    // Track activity for idle detection (skip keepalives — they don't indicate real work)
+    if (msg.type !== "keep_alive") {
+      session.lastCliActivityTs = Date.now();
+    }
+
     switch (msg.type) {
       case "system":
         this.handleSystemMessage(session, msg);
@@ -552,7 +799,7 @@ export class WsBridge {
     }
   }
 
-  private handleSystemMessage(session: Session, msg: CLISystemInitMessage | CLISystemStatusMessage) {
+  private handleSystemMessage(session: Session, msg: CLISystemMessage) {
     if (msg.subtype === "init") {
       // Keep the launcher-assigned session_id as the canonical ID.
       // The CLI may report its own internal session_id which differs
@@ -595,7 +842,10 @@ export class WsBridge {
           this.sendToCLI(session, ndjson);
         }
       }
-    } else if (msg.subtype === "status") {
+      return;
+    }
+
+    if (msg.subtype === "status") {
       session.state.is_compacting = msg.status === "compacting";
 
       if (msg.permissionMode) {
@@ -606,8 +856,116 @@ export class WsBridge {
         type: "status_change",
         status: msg.status ?? null,
       });
+      return;
     }
-    // Other system subtypes (compact_boundary, task_notification, etc.) can be forwarded as needed
+
+    if (msg.subtype === "compact_boundary") {
+      this.forwardSystemEvent(session, {
+        subtype: "compact_boundary",
+        compact_metadata: msg.compact_metadata,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "task_notification") {
+      this.forwardSystemEvent(session, {
+        subtype: "task_notification",
+        task_id: msg.task_id,
+        status: msg.status,
+        output_file: msg.output_file,
+        summary: msg.summary,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "files_persisted") {
+      this.forwardSystemEvent(session, {
+        subtype: "files_persisted",
+        files: msg.files,
+        failed: msg.failed,
+        processed_at: msg.processed_at,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "hook_started") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_started",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    if (msg.subtype === "hook_progress") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_progress",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        stdout: msg.stdout,
+        stderr: msg.stderr,
+        output: msg.output,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      }, { persistInHistory: false });
+      return;
+    }
+
+    if (msg.subtype === "hook_response") {
+      this.forwardSystemEvent(session, {
+        subtype: "hook_response",
+        hook_id: msg.hook_id,
+        hook_name: msg.hook_name,
+        hook_event: msg.hook_event,
+        output: msg.output,
+        stdout: msg.stdout,
+        stderr: msg.stderr,
+        exit_code: msg.exit_code,
+        outcome: msg.outcome,
+        uuid: msg.uuid,
+        session_id: msg.session_id,
+      });
+      return;
+    }
+
+    // Unknown system subtypes are intentionally ignored until we map them.
+  }
+
+  /** Append to messageHistory with cap to prevent unbounded memory growth. */
+  private appendHistory(session: Session, msg: BrowserIncomingMessage) {
+    session.messageHistory.push(msg);
+    if (session.messageHistory.length > WsBridge.MESSAGE_HISTORY_LIMIT) {
+      session.messageHistory.splice(0, session.messageHistory.length - WsBridge.MESSAGE_HISTORY_LIMIT);
+    }
+  }
+
+  private forwardSystemEvent(
+    session: Session,
+    event: Extract<BrowserIncomingMessage, { type: "system_event" }>["event"],
+    options: { persistInHistory?: boolean } = {},
+  ) {
+    const browserMsg: BrowserIncomingMessage = {
+      type: "system_event",
+      event,
+      timestamp: Date.now(),
+    };
+
+    if (options.persistInHistory !== false) {
+      this.appendHistory(session, browserMsg);
+      this.persistSession(session);
+    }
+
+    this.broadcastToBrowsers(session, browserMsg);
   }
 
   private handleAssistantMessage(session: Session, msg: CLIAssistantMessage) {
@@ -617,8 +975,11 @@ export class WsBridge {
       parent_tool_use_id: msg.parent_tool_use_id,
       timestamp: Date.now(),
     };
-    session.messageHistory.push(browserMsg);
+    this.appendHistory(session, browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
+    this.assistantMessageListeners.get(session.id)?.forEach((cb) => {
+      try { cb(browserMsg); } catch (err) { console.error("[ws-bridge] Assistant listener error:", err); }
+    });
     this.persistSession(session);
   }
 
@@ -654,8 +1015,13 @@ export class WsBridge {
       type: "result",
       data: msg,
     };
-    session.messageHistory.push(browserMsg);
+    this.appendHistory(session, browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
+    this.resultListeners.get(session.id)?.forEach((cb) => {
+      try {
+        Promise.resolve(cb(browserMsg)).catch((err) => console.error("[ws-bridge] Async result listener error:", err));
+      } catch (err) { console.error("[ws-bridge] Result listener error:", err); }
+    });
     this.persistSession(session);
 
     // Trigger auto-naming after the first successful result for this session.
@@ -684,7 +1050,7 @@ export class WsBridge {
     });
   }
 
-  private handleControlRequest(session: Session, msg: CLIControlRequestMessage) {
+  private async handleControlRequest(session: Session, msg: CLIControlRequestMessage) {
     if (msg.request.subtype === "can_use_tool") {
       const perm: PermissionRequest = {
         request_id: msg.request_id,
@@ -696,6 +1062,43 @@ export class WsBridge {
         agent_id: msg.request.agent_id,
         timestamp: Date.now(),
       };
+
+      // AI Validation Mode: evaluate the tool call before showing to user
+      const aiSettings = getEffectiveAiValidation(session.state);
+      if (
+        aiSettings.enabled
+        && aiSettings.anthropicApiKey
+        && msg.request.tool_name !== "AskUserQuestion"
+        && msg.request.tool_name !== "ExitPlanMode"
+      ) {
+        try {
+          const result = await validatePermission(
+            msg.request.tool_name,
+            msg.request.input,
+            msg.request.description,
+          );
+          perm.ai_validation = {
+            verdict: result.verdict,
+            reason: result.reason,
+            ruleBasedOnly: result.ruleBasedOnly,
+          };
+
+          // Auto-approve safe tools
+          if (result.verdict === "safe" && aiSettings.autoApprove) {
+            this.autoRespondPermission(session, msg.request_id, perm, "allow", result.reason);
+            return;
+          }
+
+          // Auto-deny dangerous tools
+          if (result.verdict === "dangerous" && aiSettings.autoDeny) {
+            this.autoRespondPermission(session, msg.request_id, perm, "deny", result.reason);
+            return;
+          }
+        } catch (err) {
+          console.warn(`[ws-bridge] AI validation error for tool=${msg.request.tool_name} request_id=${msg.request_id} session=${session.id}, falling through to manual:`, err);
+        }
+      }
+
       session.pendingPermissions.set(msg.request_id, perm);
 
       this.broadcastToBrowsers(session, {
@@ -704,6 +1107,34 @@ export class WsBridge {
       });
       this.persistSession(session);
     }
+  }
+
+  private autoRespondPermission(
+    session: Session,
+    requestId: string,
+    perm: PermissionRequest,
+    behavior: "allow" | "deny",
+    reason: string,
+  ): void {
+    // Notify browsers that AI auto-handled this permission
+    this.broadcastToBrowsers(session, {
+      type: "permission_auto_resolved",
+      request: perm,
+      behavior,
+      reason,
+    });
+
+    // Send the control_response to CLI
+    handlePermissionResponse(
+      session,
+      {
+        type: "permission_response",
+        request_id: requestId,
+        behavior,
+        message: behavior === "deny" ? `AI validation: ${reason}` : undefined,
+      },
+      this.sendToCLI.bind(this),
+    );
   }
 
   private handleToolProgress(session: Session, msg: CLIToolProgressMessage) {
@@ -776,7 +1207,7 @@ export class WsBridge {
       // Store user messages in history for replay with stable ID for dedup on reconnect
       if (msg.type === "user_message") {
         const ts = Date.now();
-        session.messageHistory.push({
+        this.appendHistory(session, {
           type: "user_message",
           content: msg.content,
           timestamp: ts,
@@ -790,7 +1221,18 @@ export class WsBridge {
       }
 
       if (session.codexAdapter) {
-        session.codexAdapter.sendBrowserMessage(msg);
+        const accepted = session.codexAdapter.sendBrowserMessage(msg);
+        if (!accepted) {
+          // A stale or half-initialized Codex adapter can reject messages even
+          // while still attached to the session. Queue the message so it
+          // survives the ensuing relaunch instead of dropping it silently.
+          console.warn(`[ws-bridge] Codex adapter rejected ${msg.type} for session ${session.id}; queuing for relaunch`);
+          session.pendingMessages.push(JSON.stringify(msg));
+          this.persistSession(session);
+          if (this.onCLIRelaunchNeeded) {
+            this.onCLIRelaunchNeeded(session.id);
+          }
+        }
       } else {
         // Adapter not yet attached — queue for when it's ready.
         // The adapter itself also queues during init, but this covers
@@ -821,6 +1263,19 @@ export class WsBridge {
 
       case "set_permission_mode":
         handleSetPermissionMode(session, msg.mode, this.sendToCLI.bind(this));
+        break;
+
+      case "set_ai_validation":
+        handleSetAiValidation(session, msg);
+        this.persistSession(session);
+        this.broadcastToBrowsers(session, {
+          type: "session_update",
+          session: {
+            aiValidationEnabled: session.state.aiValidationEnabled,
+            aiValidationAutoApprove: session.state.aiValidationAutoApprove,
+            aiValidationAutoDeny: session.state.aiValidationAutoDeny,
+          },
+        });
         break;
 
       case "mcp_get_status":
@@ -879,7 +1334,7 @@ export class WsBridge {
   ) {
     // Store user message in history for replay with stable ID for dedup on reconnect
     const ts = Date.now();
-    session.messageHistory.push({
+    this.appendHistory(session, {
       type: "user_message",
       content: msg.content,
       timestamp: ts,

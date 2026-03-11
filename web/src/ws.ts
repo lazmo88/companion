@@ -1,5 +1,5 @@
 import { useStore } from "./store.js";
-import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, SdkSessionInfo, McpServerConfig } from "./types.js";
+import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, ProcessItem, ProcessStatus, SdkSessionInfo, McpServerConfig } from "./types.js";
 import { generateUniqueSessionName } from "./utils/names.js";
 import { playNotificationSound } from "./utils/notification-sound.js";
 
@@ -9,8 +9,41 @@ const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const lastSeqBySession = new Map<string, number>();
 const taskCounters = new Map<string, number>();
 const streamingPhaseBySession = new Map<string, "thinking" | "text">();
+const streamingDraftMessageIdBySession = new Map<string, string>();
 /** Track processed tool_use IDs to prevent duplicate task creation */
 const processedToolUseIds = new Map<string, Set<string>>();
+
+// ── Page visibility handling ─────────────────────────────────────────────────
+// Mobile browsers (Android Chrome, iOS Safari) aggressively kill WebSocket
+// connections when the page is backgrounded. Without this handler, the frontend
+// enters a rapid connect/disconnect cycle: WS opens, browser kills it, 2s
+// reconnect timer fires, WS opens again, browser kills it again...
+//
+// Solution: when the page becomes hidden, pause all reconnect attempts. When
+// the page becomes visible again, immediately reconnect all active sessions.
+let pageHidden = typeof document !== "undefined" ? document.hidden : false;
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      pageHidden = true;
+      // Cancel all pending reconnect timers — no point reconnecting while hidden
+      for (const [sessionId, timer] of reconnectTimers) {
+        clearTimeout(timer);
+        reconnectTimers.delete(sessionId);
+      }
+    } else {
+      pageHidden = false;
+      // Page is visible again — reconnect all active sessions
+      const store = useStore.getState();
+      for (const s of store.sdkSessions) {
+        if (!s.archived && !sockets.has(s.sessionId)) {
+          connectSession(s.sessionId);
+        }
+      }
+    }
+  });
+}
 
 function normalizePath(path: string): string {
   const isAbs = path.startsWith("/");
@@ -114,13 +147,76 @@ function extractChangedFilesFromBlocks(sessionId: string, blocks: ContentBlock[]
   const sessionCwd =
     store.sessions.get(sessionId)?.cwd ||
     store.sdkSessions.find((sdk) => sdk.sessionId === sessionId)?.cwd;
+  let dirty = false;
   for (const block of blocks) {
     if (block.type !== "tool_use") continue;
     const { name, input } = block;
     if ((name === "Edit" || name === "Write") && typeof input.file_path === "string") {
       const resolvedPath = resolveSessionFilePath(input.file_path, sessionCwd);
       if (isPathInSessionScope(resolvedPath, sessionCwd)) {
-        store.addChangedFile(sessionId, resolvedPath);
+        dirty = true;
+      }
+    }
+  }
+  if (dirty) store.bumpChangedFilesTick(sessionId);
+}
+
+/** Pending background Bash calls awaiting their tool_result (keyed by sessionId → toolUseId) */
+const pendingBackgroundBash = new Map<string, Map<string, { command: string; description: string; startedAt: number }>>();
+
+const BG_RESULT_REGEX = /Command running in background with ID:\s*(\S+)\.\s*Output is being written to:\s*(\S+)/;
+
+function extractProcessesFromBlocks(sessionId: string, blocks: ContentBlock[]) {
+  const store = useStore.getState();
+
+  for (const block of blocks) {
+    // Phase 1: Detect Bash tool_use with run_in_background
+    if (block.type === "tool_use" && block.name === "Bash") {
+      const input = block.input as Record<string, unknown>;
+      if (input.run_in_background === true) {
+        let sessionPending = pendingBackgroundBash.get(sessionId);
+        if (!sessionPending) {
+          sessionPending = new Map();
+          pendingBackgroundBash.set(sessionId, sessionPending);
+        }
+        sessionPending.set(block.id, {
+          command: (input.command as string) || "",
+          description: (input.description as string) || "",
+          startedAt: Date.now(),
+        });
+      }
+    }
+
+    // Phase 2: Match tool_result to a pending background Bash
+    if (block.type === "tool_result") {
+      const toolUseId = block.tool_use_id;
+      const sessionPending = pendingBackgroundBash.get(sessionId);
+      const pending = sessionPending?.get(toolUseId);
+      if (sessionPending && pending) {
+        const content = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((b) => ("text" in b ? (b as { text: string }).text : "")).join("")
+            : "";
+
+        const match = content.match(BG_RESULT_REGEX);
+        if (match) {
+          const processItem: ProcessItem = {
+            taskId: match[1],
+            toolUseId,
+            command: pending.command,
+            description: pending.description,
+            outputFile: match[2],
+            status: "running",
+            startedAt: pending.startedAt,
+          };
+          store.addProcess(sessionId, processItem);
+        }
+
+        sessionPending.delete(toolUseId);
+        if (sessionPending.size === 0) {
+          pendingBackgroundBash.delete(sessionId);
+        }
       }
     }
   }
@@ -132,10 +228,114 @@ function sendBrowserNotification(title: string, body: string, tag: string) {
   new Notification(title, { body, tag });
 }
 
+function summarizeSystemEvent(
+  event: Extract<BrowserIncomingMessage, { type: "system_event" }>["event"],
+): string | null {
+  if (event.subtype === "compact_boundary") {
+    return `Context compacted (${event.compact_metadata.trigger}, pre-tokens: ${event.compact_metadata.pre_tokens}).`;
+  }
+
+  if (event.subtype === "task_notification") {
+    const summary = event.summary ? ` ${event.summary}` : "";
+    return `Task ${event.status}: ${event.task_id}.${summary}`;
+  }
+
+  if (event.subtype === "files_persisted") {
+    const persisted = event.files.length;
+    const failed = event.failed.length;
+    if (failed > 0) {
+      return `Persisted ${persisted} file(s), ${failed} failed.`;
+    }
+    return `Persisted ${persisted} file(s).`;
+  }
+
+  if (event.subtype === "hook_started") {
+    return `Hook started: ${event.hook_name} (${event.hook_event}).`;
+  }
+
+  if (event.subtype === "hook_response") {
+    const exitCode = typeof event.exit_code === "number" ? ` (exit ${event.exit_code})` : "";
+    return `Hook ${event.outcome}: ${event.hook_name} (${event.hook_event})${exitCode}.`;
+  }
+
+  // hook_progress can be high-volume; keep it out of chat by default.
+  return null;
+}
+
 let idCounter = 0;
 let clientMsgCounter = 0;
 function nextId(): string {
   return `msg-${Date.now()}-${++idCounter}`;
+}
+
+function setStreamingDraftMessage(sessionId: string, content: string) {
+  const store = useStore.getState();
+  const existing = store.messages.get(sessionId) || [];
+  const messages = [...existing];
+  const existingDraftId = streamingDraftMessageIdBySession.get(sessionId);
+  let draftIndex = -1;
+
+  if (existingDraftId) {
+    draftIndex = messages.findIndex((m) => m.id === existingDraftId);
+    if (draftIndex === -1) {
+      streamingDraftMessageIdBySession.delete(sessionId);
+    }
+  }
+
+  if (draftIndex === -1) {
+    const id = `stream-${sessionId}-${nextId()}`;
+    streamingDraftMessageIdBySession.set(sessionId, id);
+    messages.push({
+      id,
+      role: "assistant",
+      content,
+      timestamp: Date.now(),
+      isStreaming: true,
+    });
+  } else {
+    const prev = messages[draftIndex];
+    messages[draftIndex] = {
+      ...prev,
+      role: "assistant",
+      content,
+      isStreaming: true,
+    };
+  }
+
+  store.setMessages(sessionId, messages);
+}
+
+function finalizeStreamingDraftMessage(sessionId: string, finalMessage: ChatMessage): boolean {
+  const draftId = streamingDraftMessageIdBySession.get(sessionId);
+  if (!draftId) return false;
+
+  const store = useStore.getState();
+  const existing = store.messages.get(sessionId) || [];
+  const draftIndex = existing.findIndex((m) => m.id === draftId);
+  if (draftIndex === -1) {
+    streamingDraftMessageIdBySession.delete(sessionId);
+    return false;
+  }
+
+  const messages = [...existing];
+  messages[draftIndex] = finalMessage;
+  store.setMessages(sessionId, messages);
+  streamingDraftMessageIdBySession.delete(sessionId);
+  return true;
+}
+
+function clearStreamingDraftMessage(sessionId: string) {
+  const draftId = streamingDraftMessageIdBySession.get(sessionId);
+  if (!draftId) return;
+
+  const store = useStore.getState();
+  const existing = store.messages.get(sessionId) || [];
+  const next = existing.filter((m) => m.id !== draftId);
+  if (next.length !== existing.length) {
+    store.setMessages(sessionId, next);
+  }
+
+  streamingDraftMessageIdBySession.delete(sessionId);
 }
 
 function nextClientMsgId(): string {
@@ -152,11 +352,13 @@ const IDEMPOTENT_OUTGOING_TYPES = new Set<BrowserOutgoingMessage["type"]>([
   "mcp_toggle",
   "mcp_reconnect",
   "mcp_set_servers",
+  "set_ai_validation",
 ]);
 
 function getWsUrl(sessionId: string): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws/browser/${sessionId}`;
+  const token = localStorage.getItem("companion_auth_token") || "";
+  return `${proto}//${location.host}/ws/browser/${sessionId}?token=${encodeURIComponent(token)}`;
 }
 
 function getLastSeqStorageKey(sessionId: string): string {
@@ -200,6 +402,58 @@ function extractTextFromBlocks(blocks: ContentBlock[]): string {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function mergeContentBlocks(prev?: ContentBlock[], next?: ContentBlock[]): ContentBlock[] | undefined {
+  const prevBlocks = prev || [];
+  const nextBlocks = next || [];
+  if (prevBlocks.length === 0 && nextBlocks.length === 0) return undefined;
+
+  const merged: ContentBlock[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (block: ContentBlock) => {
+    const key = JSON.stringify(block);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(block);
+  };
+
+  for (const block of prevBlocks) pushUnique(block);
+  for (const block of nextBlocks) pushUnique(block);
+  return merged;
+}
+
+function mergeAssistantMessage(previous: ChatMessage, incoming: ChatMessage): ChatMessage {
+  const mergedBlocks = mergeContentBlocks(previous.contentBlocks, incoming.contentBlocks);
+  const mergedContent = mergedBlocks && mergedBlocks.length > 0
+    ? extractTextFromBlocks(mergedBlocks)
+    : (incoming.content || previous.content);
+
+  return {
+    ...previous,
+    ...incoming,
+    content: mergedContent,
+    contentBlocks: mergedBlocks,
+    // Keep the original timestamp position when this is an in-place assistant update.
+    timestamp: previous.timestamp ?? incoming.timestamp,
+    // Explicitly clear stale streaming marker when incoming is final.
+    isStreaming: incoming.isStreaming,
+  };
+}
+
+function upsertAssistantMessage(sessionId: string, incoming: ChatMessage) {
+  const store = useStore.getState();
+  const existing = store.messages.get(sessionId) || [];
+  const index = existing.findIndex((m) => m.role === "assistant" && m.id === incoming.id);
+  if (index === -1) {
+    store.appendMessage(sessionId, incoming);
+    return;
+  }
+
+  const messages = [...existing];
+  messages[index] = mergeAssistantMessage(messages[index], incoming);
+  store.setMessages(sessionId, messages);
 }
 
 function handleMessage(sessionId: string, event: MessageEvent) {
@@ -270,7 +524,10 @@ function handleParsedMessage(
         model: msg.model,
         stopReason: msg.stop_reason,
       };
-      store.appendMessage(sessionId, chatMsg);
+      const replacedDraft = finalizeStreamingDraftMessage(sessionId, chatMsg);
+      if (!replacedDraft) {
+        upsertAssistantMessage(sessionId, chatMsg);
+      }
       store.setStreaming(sessionId, null);
       streamingPhaseBySession.delete(sessionId);
       // Clear progress only for completed tools (tool_result blocks), not all tools.
@@ -293,6 +550,7 @@ function handleParsedMessage(
       if (msg.content?.length) {
         extractTasksFromBlocks(sessionId, msg.content);
         extractChangedFilesFromBlocks(sessionId, msg.content);
+        extractProcessesFromBlocks(sessionId, msg.content);
       }
 
       break;
@@ -304,6 +562,7 @@ function handleParsedMessage(
         // message_start → mark generation start time
         if (evt.type === "message_start") {
           streamingPhaseBySession.delete(sessionId);
+          clearStreamingDraftMessage(sessionId);
           if (!store.streamingStartedAt.has(sessionId)) {
             store.setStreamingStats(sessionId, { startedAt: Date.now(), outputTokens: 0 });
           }
@@ -320,7 +579,9 @@ function handleParsedMessage(
               current += responsePrefix;
             }
             streamingPhaseBySession.set(sessionId, "text");
-            store.setStreaming(sessionId, current + delta.text);
+            const nextText = current + delta.text;
+            store.setStreaming(sessionId, nextText);
+            setStreamingDraftMessage(sessionId, nextText);
           }
           if (delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
             const current = store.streaming.get(sessionId) || "";
@@ -330,7 +591,9 @@ function handleParsedMessage(
               ? (current.startsWith(prefix) ? current : prefix)
               : prefix;
             streamingPhaseBySession.set(sessionId, "thinking");
-            store.setStreaming(sessionId, base + delta.thinking);
+            const nextText = base + delta.thinking;
+            store.setStreaming(sessionId, nextText);
+            setStreamingDraftMessage(sessionId, nextText);
           }
         }
 
@@ -374,6 +637,7 @@ function handleParsedMessage(
         }
       }
       store.updateSession(sessionId, sessionUpdates);
+      clearStreamingDraftMessage(sessionId);
       store.setStreaming(sessionId, null);
       streamingPhaseBySession.delete(sessionId);
       store.setStreamingStats(sessionId, null);
@@ -418,12 +682,23 @@ function handleParsedMessage(
         }];
         extractTasksFromBlocks(sessionId, permBlocks);
         extractChangedFilesFromBlocks(sessionId, permBlocks);
+        extractProcessesFromBlocks(sessionId, permBlocks);
       }
       break;
     }
 
     case "permission_cancelled": {
       store.removePermission(sessionId, data.request_id);
+      break;
+    }
+
+    case "permission_auto_resolved": {
+      store.addAiResolvedPermission(sessionId, {
+        request: data.request,
+        behavior: data.behavior,
+        reason: data.reason,
+        timestamp: Date.now(),
+      });
       break;
     }
 
@@ -441,6 +716,30 @@ function handleParsedMessage(
         role: "system",
         content: data.summary,
         timestamp: Date.now(),
+      });
+      break;
+    }
+
+    case "system_event": {
+      // Update structured process state from task_notification
+      if (data.event?.subtype === "task_notification") {
+        const { task_id, status, summary: taskSummary } = data.event;
+        if (task_id && status) {
+          store.updateProcess(sessionId, task_id, {
+            status: status as ProcessStatus,
+            completedAt: Date.now(),
+            summary: taskSummary || undefined,
+          });
+        }
+      }
+
+      const summary = summarizeSystemEvent(data.event);
+      if (!summary) break;
+      store.appendMessage(sessionId, {
+        id: nextId(),
+        role: "system",
+        content: summary,
+        timestamp: data.timestamp || Date.now(),
       });
       break;
     }
@@ -522,7 +821,7 @@ function handleParsedMessage(
         } else if (histMsg.type === "assistant") {
           const msg = histMsg.message;
           const textContent = extractTextFromBlocks(msg.content);
-          chatMessages.push({
+          const assistantMsg: ChatMessage = {
             id: msg.id,
             role: "assistant",
             content: textContent,
@@ -531,11 +830,18 @@ function handleParsedMessage(
             parentToolUseId: histMsg.parent_tool_use_id,
             model: msg.model,
             stopReason: msg.stop_reason,
-          });
-          // Also extract tasks and changed files from history
+          };
+          const existingIndex = chatMessages.findIndex((m) => m.role === "assistant" && m.id === assistantMsg.id);
+          if (existingIndex === -1) {
+            chatMessages.push(assistantMsg);
+          } else {
+            chatMessages[existingIndex] = mergeAssistantMessage(chatMessages[existingIndex], assistantMsg);
+          }
+          // Also extract tasks, changed files, and background processes from history
           if (msg.content?.length) {
             extractTasksFromBlocks(sessionId, msg.content);
             extractChangedFilesFromBlocks(sessionId, msg.content);
+            extractProcessesFromBlocks(sessionId, msg.content);
           }
         } else if (histMsg.type === "result") {
           const r = histMsg.data;
@@ -547,6 +853,36 @@ function handleParsedMessage(
               timestamp: Date.now(),
             });
           }
+          // Track cost/turns from history result, same as the live result handler
+          const resultUpdates: Partial<{ total_cost_usd: number; num_turns: number; context_used_percent: number; total_lines_added: number; total_lines_removed: number }> = {
+            total_cost_usd: r.total_cost_usd,
+            num_turns: r.num_turns,
+          };
+          if (typeof r.total_lines_added === "number") {
+            resultUpdates.total_lines_added = r.total_lines_added;
+          }
+          if (typeof r.total_lines_removed === "number") {
+            resultUpdates.total_lines_removed = r.total_lines_removed;
+          }
+          if (r.modelUsage) {
+            for (const usage of Object.values(r.modelUsage)) {
+              if ((usage as { contextWindow: number; inputTokens: number; outputTokens: number }).contextWindow > 0) {
+                const u = usage as { contextWindow: number; inputTokens: number; outputTokens: number };
+                const pct = Math.round(((u.inputTokens + u.outputTokens) / u.contextWindow) * 100);
+                resultUpdates.context_used_percent = Math.max(0, Math.min(pct, 100));
+              }
+            }
+          }
+          store.updateSession(sessionId, resultUpdates);
+        } else if (histMsg.type === "system_event") {
+          const summary = summarizeSystemEvent(histMsg.event);
+          if (!summary) continue;
+          chatMessages.push({
+            id: `hist-system-event-${i}`,
+            role: "system",
+            content: summary,
+            timestamp: histMsg.timestamp || Date.now(),
+          });
         }
       }
       if (chatMessages.length > 0) {
@@ -555,17 +891,36 @@ function handleParsedMessage(
           // Initial connect: history is the full truth
           store.setMessages(sessionId, chatMessages);
         } else {
-          // Reconnect: merge history with live messages, dedup by ID
-          const existingIds = new Set(existing.map((m) => m.id));
-          const newFromHistory = chatMessages.filter((m) => !existingIds.has(m.id));
-          if (newFromHistory.length > 0) {
-            // Merge and sort by timestamp to maintain chronological order
-            const merged = [...newFromHistory, ...existing].sort(
-              (a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0),
-            );
-            store.setMessages(sessionId, merged);
+          // Reconnect: merge history with live messages, upserting duplicate assistant IDs.
+          const merged = [...existing];
+          for (const incoming of chatMessages) {
+            const idx = merged.findIndex((m) => m.id === incoming.id);
+            if (idx === -1) {
+              merged.push(incoming);
+              continue;
+            }
+            const current = merged[idx];
+            if (current.role === "assistant" && incoming.role === "assistant") {
+              merged[idx] = mergeAssistantMessage(current, incoming);
+            } else {
+              merged[idx] = incoming;
+            }
           }
+          merged.sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+          store.setMessages(sessionId, merged);
         }
+      }
+      // Fix: if the last history message is a `result`, the session's last turn
+      // is complete. Clear any stale streaming state that event_replay might not
+      // correct (e.g. when `result` was pruned from the 600-event buffer).
+      const lastHistMsg = data.messages[data.messages.length - 1];
+      if (lastHistMsg?.type === "result") {
+        clearStreamingDraftMessage(sessionId);
+        store.setStreaming(sessionId, null);
+        streamingPhaseBySession.delete(sessionId);
+        store.setStreamingStats(sessionId, null);
+        store.clearToolProgress(sessionId);
+        store.setSessionStatus(sessionId, "idle");
       }
       break;
     }
@@ -628,8 +983,14 @@ export function connectSession(sessionId: string) {
 
 function scheduleReconnect(sessionId: string) {
   if (reconnectTimers.has(sessionId)) return;
+  // Don't schedule reconnect when page is hidden — mobile browsers will just
+  // kill the new connection too, creating a wasteful connect/disconnect cycle.
+  // The visibilitychange handler will reconnect when the page becomes visible.
+  if (pageHidden) return;
   const timer = setTimeout(() => {
     reconnectTimers.delete(sessionId);
+    // Re-check visibility — page may have been hidden during the delay
+    if (pageHidden) return;
     const store = useStore.getState();
     // Reconnect any active (non-archived) session
     const sdkSession = store.sdkSessions.find((s) => s.sessionId === sessionId);
@@ -652,8 +1013,10 @@ export function disconnectSession(sessionId: string) {
     sockets.delete(sessionId);
   }
   processedToolUseIds.delete(sessionId);
+  pendingBackgroundBash.delete(sessionId);
   taskCounters.delete(sessionId);
   streamingPhaseBySession.delete(sessionId);
+  streamingDraftMessageIdBySession.delete(sessionId);
   lastSeqBySession.delete(sessionId);
 }
 
@@ -664,6 +1027,9 @@ export function disconnectAll() {
 }
 
 export function connectAllSessions(sessions: SdkSessionInfo[]) {
+  // Skip connection attempts when page is hidden — mobile browsers kill
+  // backgrounded WS connections, so connecting here would just cycle.
+  if (pageHidden) return;
   for (const s of sessions) {
     if (!s.archived) {
       connectSession(s.sessionId);
@@ -702,6 +1068,7 @@ export function sendToSession(sessionId: string, msg: BrowserOutgoingMessage) {
       case "mcp_toggle":
       case "mcp_reconnect":
       case "mcp_set_servers":
+      case "set_ai_validation":
         if (!msg.client_msg_id) {
           outgoing = { ...msg, client_msg_id: nextClientMsgId() };
         }
@@ -727,4 +1094,15 @@ export function sendMcpReconnect(sessionId: string, serverName: string) {
 
 export function sendMcpSetServers(sessionId: string, servers: Record<string, McpServerConfig>) {
   sendToSession(sessionId, { type: "mcp_set_servers", servers });
+}
+
+export function sendSetAiValidation(
+  sessionId: string,
+  settings: {
+    aiValidationEnabled?: boolean | null;
+    aiValidationAutoApprove?: boolean | null;
+    aiValidationAutoDeny?: boolean | null;
+  },
+) {
+  sendToSession(sessionId, { type: "set_ai_validation", ...settings });
 }

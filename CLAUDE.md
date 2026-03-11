@@ -22,6 +22,10 @@ cd web && bun run typecheck
 # Production build + serve
 cd web && bun run build && bun run start
 
+# Auth token management
+cd web && bun run generate-token          # show current token
+cd web && bun run generate-token --force  # regenerate a new token
+
 # Landing page (thecompanion.sh) — idempotent: starts if down, no-op if up
 # IMPORTANT: Always use this script to run the landing page. Never cd into landing/ and run bun/vite manually.
 ./scripts/landing-start.sh          # start
@@ -103,7 +107,7 @@ The server automatically records **all raw protocol messages** (both Claude Code
 - **Format**: JSONL — one JSON object per line. First line is a header with session metadata, subsequent lines are raw message entries.
 - **File naming**: `{sessionId}_{backendType}_{ISO-timestamp}_{randomSuffix}.jsonl`
 - **Disable**: set `COMPANION_RECORD=0` or `COMPANION_RECORD=false`
-- **Rotation**: automatic cleanup when total lines exceed 100k (configurable via `COMPANION_RECORDINGS_MAX_LINES`)
+- **Rotation**: automatic cleanup when total lines exceed 1M (configurable via `COMPANION_RECORDINGS_MAX_LINES`)
 
 Each entry captures:
 ```json
@@ -181,3 +185,17 @@ gh pr edit --body-file /tmp/pr_body.md
 ## Codex & Claude Code
 - All features must be compatible with both Codex and Claude Code. If a feature is only compatible with one, it must be gated behind a clear UI affordance (e.g. "This feature requires Claude Code") and the incompatible option should be hidden or disabled.
 - When implementing a new feature, always consider how it will work with both models and test with both if possible. If a feature is only implemented for one model, document that clearly in the code and in the UI.
+
+## Cursor Cloud specific instructions
+
+### Services
+- **Hono backend** (port 3457 in dev): `cd web && bun run dev:api` or via `./scripts/dev-start.sh`
+- **Vite frontend** (port 5174 in dev): `cd web && bun run dev:vite` or via `./scripts/dev-start.sh`
+- Both start together with `cd web && bun run dev` (or `make dev`), but that runs in foreground. Use `./scripts/dev-start.sh` for background mode.
+
+### Caveats
+- `./scripts/dev-start.sh` health-checks the backend on `/` which returns 404. If the script times out, the backend is still running — verify with `curl http://localhost:3457/api/sessions`. You can start the servers manually as background processes instead.
+- The app requires Claude Code CLI or Codex CLI to create functional sessions. Without them, the UI loads but session creation will fail. The component playground at `#/playground` works without any CLI.
+- No external databases or services are needed. Session state persists to `$TMPDIR/vibe-sessions/` as JSON files.
+- The pre-commit hook (`.husky/pre-commit`) runs `cd web && bun run typecheck && bun run test -- --coverage`. Run these before committing.
+- Two blocked postinstalls (`core-js`, `protobufjs`) are harmless and do not affect functionality.

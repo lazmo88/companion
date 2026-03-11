@@ -4,6 +4,7 @@ import { connectSession } from "./ws.js";
 import { api } from "./api.js";
 import { capturePageView } from "./analytics.js";
 import { parseHash, navigateToSession } from "./utils/routing.js";
+import { LoginPage } from "./components/LoginPage.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { ChatView } from "./components/ChatView.js";
 import { TopBar } from "./components/TopBar.js";
@@ -14,6 +15,7 @@ import { UpdateBanner } from "./components/UpdateBanner.js";
 import { SessionLaunchOverlay } from "./components/SessionLaunchOverlay.js";
 import { SessionTerminalDock } from "./components/SessionTerminalDock.js";
 import { SessionEditorPane } from "./components/SessionEditorPane.js";
+import { SessionBrowserPane } from "./components/SessionBrowserPane.js";
 import { UpdateOverlay } from "./components/UpdateOverlay.js";
 
 // Lazy-loaded route-level pages (not needed for initial render)
@@ -21,10 +23,16 @@ const Playground = lazy(() => import("./components/Playground.js").then((m) => (
 const SettingsPage = lazy(() => import("./components/SettingsPage.js").then((m) => ({ default: m.SettingsPage })));
 const IntegrationsPage = lazy(() => import("./components/IntegrationsPage.js").then((m) => ({ default: m.IntegrationsPage })));
 const LinearSettingsPage = lazy(() => import("./components/LinearSettingsPage.js").then((m) => ({ default: m.LinearSettingsPage })));
+const TailscalePage = lazy(() => import("./components/TailscalePage.js").then((m) => ({ default: m.TailscalePage })));
 const PromptsPage = lazy(() => import("./components/PromptsPage.js").then((m) => ({ default: m.PromptsPage })));
 const EnvManager = lazy(() => import("./components/EnvManager.js").then((m) => ({ default: m.EnvManager })));
+const DockerBuilderPage = lazy(() => import("./components/DockerBuilderPage.js").then((m) => ({ default: m.DockerBuilderPage })));
 const CronManager = lazy(() => import("./components/CronManager.js").then((m) => ({ default: m.CronManager })));
+const AgentsPage = lazy(() => import("./components/AgentsPage.js").then((m) => ({ default: m.AgentsPage })));
+const RunsPage = lazy(() => import("./components/RunsPage.js").then((m) => ({ default: m.RunsPage })));
 const TerminalPage = lazy(() => import("./components/TerminalPage.js").then((m) => ({ default: m.TerminalPage })));
+const ProcessPanel = lazy(() => import("./components/ProcessPanel.js").then((m) => ({ default: m.ProcessPanel })));
+
 
 function LazyFallback() {
   return (
@@ -42,14 +50,13 @@ function useHash() {
 }
 
 export default function App() {
+  const isAuthenticated = useStore((s) => s.isAuthenticated);
   const darkMode = useStore((s) => s.darkMode);
   const currentSessionId = useStore((s) => s.currentSessionId);
   const sidebarOpen = useStore((s) => s.sidebarOpen);
   const taskPanelOpen = useStore((s) => s.taskPanelOpen);
   const homeResetKey = useStore((s) => s.homeResetKey);
   const activeTab = useStore((s) => s.activeTab);
-  const editorTabEnabled = useStore((s) => s.editorTabEnabled);
-  const setEditorTabEnabled = useStore((s) => s.setEditorTabEnabled);
   const setActiveTab = useStore((s) => s.setActiveTab);
   const sessionCreating = useStore((s) => s.sessionCreating);
   const sessionCreatingBackend = useStore((s) => s.sessionCreatingBackend);
@@ -62,9 +69,13 @@ export default function App() {
   const isPromptsPage = route.page === "prompts";
   const isIntegrationsPage = route.page === "integrations";
   const isLinearIntegrationPage = route.page === "integration-linear";
+  const isTailscaleIntegrationPage = route.page === "integration-tailscale";
   const isTerminalPage = route.page === "terminal";
   const isEnvironmentsPage = route.page === "environments";
+  const isDockerBuilderPage = route.page === "docker-builder";
   const isScheduledPage = route.page === "scheduled";
+  const isAgentsPage = route.page === "agents" || route.page === "agent-detail";
+  const isRunsPage = route.page === "runs";
   const isSessionView = route.page === "session" || route.page === "home";
 
   useEffect(() => {
@@ -75,17 +86,12 @@ export default function App() {
     document.documentElement.classList.toggle("dark", darkMode);
   }, [darkMode]);
 
+  // Migrate legacy "files" tab to "editor"
   useEffect(() => {
-    api.getSettings().then((settings) => {
-      setEditorTabEnabled(settings.editorTabEnabled);
-    }).catch(() => {});
-  }, [setEditorTabEnabled]);
-
-  useEffect(() => {
-    if (!editorTabEnabled && activeTab === "editor") {
-      setActiveTab("chat");
+    if ((activeTab as string) === "files") {
+      setActiveTab("editor");
     }
-  }, [editorTabEnabled, activeTab, setActiveTab]);
+  }, [activeTab, setActiveTab]);
 
   // Capture the localStorage-restored session ID during render (before any effects run)
   // so the mount logic can use it even if the hash-sync branch would clear it.
@@ -116,6 +122,29 @@ export default function App() {
     // For other pages (settings, terminal, etc.), preserve currentSessionId
   }, [route]);
 
+  // Keep git changed-files count in sync for the badge regardless of which tab is active.
+  // DiffPanel does the same when mounted; this covers the case where the diff tab is closed.
+  const changedFilesTick = useStore((s) => currentSessionId ? s.changedFilesTick.get(currentSessionId) ?? 0 : 0);
+  const diffBase = useStore((s) => s.diffBase);
+  const setGitChangedFilesCount = useStore((s) => s.setGitChangedFilesCount);
+  const sessionCwd = useStore((s) => {
+    if (!currentSessionId) return null;
+    return s.sessions.get(currentSessionId)?.cwd
+      || s.sdkSessions.find((sdk) => sdk.sessionId === currentSessionId)?.cwd
+      || null;
+  });
+  useEffect(() => {
+    if (!currentSessionId || !sessionCwd) return;
+    let cancelled = false;
+    api.getChangedFiles(sessionCwd, diffBase).then(({ files }) => {
+      if (cancelled) return;
+      const prefix = `${sessionCwd}/`;
+      const count = files.filter((f) => f.path === sessionCwd || f.path.startsWith(prefix)).length;
+      setGitChangedFilesCount(currentSessionId, count);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [currentSessionId, sessionCwd, diffBase, changedFilesTick, setGitChangedFilesCount]);
+
   // Poll for updates
   useEffect(() => {
     const check = () => {
@@ -128,12 +157,24 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Load publicUrl from settings on mount (used for webhook URL generation)
+  useEffect(() => {
+    api.getSettings().then((s) => {
+      if (s.publicUrl) useStore.getState().setPublicUrl(s.publicUrl);
+    }).catch(() => {});
+  }, []);
+
+  // Auth gate: show login page when not authenticated
+  if (!isAuthenticated) {
+    return <LoginPage />;
+  }
+
   if (route.page === "playground") {
     return <Suspense fallback={<LazyFallback />}><Playground /></Suspense>;
   }
 
   return (
-    <div className="h-[100dvh] flex font-sans-ui bg-cc-bg text-cc-fg antialiased">
+    <div className="fixed inset-0 flex font-sans-ui bg-cc-bg text-cc-fg antialiased pt-safe overflow-hidden overscroll-none">
       {/* Mobile overlay backdrop */}
       {sidebarOpen && (
         <div
@@ -145,9 +186,9 @@ export default function App() {
       {/* Sidebar — overlay on mobile, inline on desktop */}
       <div
         className={`
-          fixed md:relative z-40 md:z-auto
-          h-full shrink-0 transition-all duration-200
-          ${sidebarOpen ? "w-[260px] translate-x-0" : "w-0 -translate-x-full md:w-0 md:-translate-x-full"}
+          fixed inset-y-0 left-0 md:relative md:inset-auto z-40 md:z-auto
+          h-full shrink-0 transition-all duration-200 pt-safe md:pt-0
+          ${sidebarOpen ? "w-full md:w-[260px] translate-x-0" : "w-0 -translate-x-full md:w-0 md:-translate-x-full"}
           overflow-hidden
         `}
       >
@@ -183,6 +224,12 @@ export default function App() {
             </div>
           )}
 
+          {isTailscaleIntegrationPage && (
+            <div className="absolute inset-0">
+              <Suspense fallback={<LazyFallback />}><TailscalePage embedded /></Suspense>
+            </div>
+          )}
+
           {isTerminalPage && (
             <div className="absolute inset-0">
               <Suspense fallback={<LazyFallback />}><TerminalPage /></Suspense>
@@ -195,9 +242,27 @@ export default function App() {
             </div>
           )}
 
+          {isDockerBuilderPage && (
+            <div className="absolute inset-0">
+              <Suspense fallback={<LazyFallback />}><DockerBuilderPage /></Suspense>
+            </div>
+          )}
+
           {isScheduledPage && (
             <div className="absolute inset-0">
               <Suspense fallback={<LazyFallback />}><CronManager embedded /></Suspense>
+            </div>
+          )}
+
+          {isAgentsPage && (
+            <div className="absolute inset-0">
+              <Suspense fallback={<LazyFallback />}><AgentsPage route={route} /></Suspense>
+            </div>
+          )}
+
+          {isRunsPage && (
+            <div className="absolute inset-0">
+              <Suspense fallback={<LazyFallback />}><RunsPage /></Suspense>
             </div>
           )}
 
@@ -205,7 +270,9 @@ export default function App() {
             <>
               <div className="absolute inset-0">
                 {currentSessionId ? (
-                  activeTab === "terminal"
+                  activeTab === "browser"
+                    ? <SessionBrowserPane sessionId={currentSessionId} />
+                    : activeTab === "terminal"
                     ? (
                       <SessionTerminalDock
                         sessionId={currentSessionId}
@@ -213,9 +280,11 @@ export default function App() {
                         onClosePanel={() => useStore.getState().setActiveTab("chat")}
                       />
                     )
-                    : activeTab === "editor" && editorTabEnabled
-                      ? <SessionEditorPane sessionId={currentSessionId} />
-                      : (
+                    : activeTab === "processes"
+                      ? <Suspense fallback={<LazyFallback />}><ProcessPanel sessionId={currentSessionId} /></Suspense>
+                      : activeTab === "editor"
+                        ? <SessionEditorPane sessionId={currentSessionId} />
+                        : (
                         <SessionTerminalDock sessionId={currentSessionId} suppressPanel>
                           {activeTab === "diff"
                             ? <DiffPanel sessionId={currentSessionId} />
@@ -268,9 +337,9 @@ export default function App() {
 
           <div
             className={`
-              fixed lg:relative z-40 lg:z-auto right-0 top-0
-              h-full shrink-0 transition-all duration-200
-              ${taskPanelOpen ? "w-[320px] translate-x-0" : "w-0 translate-x-full lg:w-0 lg:translate-x-full"}
+              fixed inset-y-0 right-0 lg:relative lg:inset-auto z-40 lg:z-auto
+              h-full shrink-0 transition-all duration-200 pt-safe lg:pt-0
+              ${taskPanelOpen ? "w-full lg:w-[320px] translate-x-0" : "w-0 translate-x-full lg:w-0 lg:translate-x-full"}
               overflow-hidden
             `}
           >

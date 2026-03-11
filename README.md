@@ -77,6 +77,24 @@ Claude Code / Codex CLI
 
 The bridge uses the CLI `--sdk-url` websocket path and NDJSON events.
 
+## Authentication
+
+The server auto-generates an auth token on first start, stored at `~/.companion/auth.json`. You can also manage tokens manually:
+
+```bash
+# Show the current token (or auto-generate one)
+cd web && bun run generate-token
+
+# Force-regenerate a new token
+cd web && bun run generate-token --force
+```
+
+Or set a token via environment variable (takes priority over the file):
+
+```bash
+COMPANION_AUTH_TOKEN="my-secret-token" bunx the-companion
+```
+
 ## Development
 ```bash
 make dev
@@ -96,7 +114,24 @@ bun run typecheck
 bun run test
 ```
 
+## Preview / Prerelease
+
+Every push to `main` publishes a preview artifact:
+
+| Artifact | Tag / dist-tag | Example |
+|---|---|---|
+| Docker image (moving) | `preview-main` | `docker.io/stangirard/the-companion:preview-main` |
+| Docker image (immutable) | `preview-<sha>` | `docker.io/stangirard/the-companion:preview-abc1234...` |
+| npm package | `next` | `bunx the-companion@next` |
+
+Preview builds use a patch-core bump (e.g. `0.68.1-preview.*` when stable is `0.68.0`) so the in-app update checker can detect them as semver-ahead of the current stable release. They are **not** production-stable — use `latest` / semver tags for stable releases.
+
+### Tracking prerelease updates in-app
+
+In **Settings > Updates**, switch the update channel to **Prerelease** to receive preview builds. The default channel is **Stable** (semver releases only). Switching channels takes effect immediately on the next update check.
+
 ## Docs
+- **Full documentation**: [`docs/`](docs/) (Mintlify — run `cd docs && mint dev` to preview locally)
 - Protocol reverse engineering: [`WEBSOCKET_PROTOCOL_REVERSED.md`](WEBSOCKET_PROTOCOL_REVERSED.md)
 - Contributor and architecture guide: [`CLAUDE.md`](CLAUDE.md)
 

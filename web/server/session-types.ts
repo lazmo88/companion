@@ -29,6 +29,86 @@ export interface CLISystemStatusMessage {
   session_id: string;
 }
 
+export interface CLICompactBoundaryMessage {
+  type: "system";
+  subtype: "compact_boundary";
+  compact_metadata: {
+    trigger: "manual" | "auto";
+    pre_tokens: number;
+  };
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLITaskNotificationMessage {
+  type: "system";
+  subtype: "task_notification";
+  task_id: string;
+  status: "completed" | "failed" | "stopped";
+  output_file: string;
+  summary: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIFilesPersistedMessage {
+  type: "system";
+  subtype: "files_persisted";
+  files: { filename: string; file_id: string }[];
+  failed: { filename: string; error: string }[];
+  processed_at: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookStartedMessage {
+  type: "system";
+  subtype: "hook_started";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookProgressMessage {
+  type: "system";
+  subtype: "hook_progress";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  stdout: string;
+  stderr: string;
+  output: string;
+  uuid: string;
+  session_id: string;
+}
+
+export interface CLIHookResponseMessage {
+  type: "system";
+  subtype: "hook_response";
+  hook_id: string;
+  hook_name: string;
+  hook_event: string;
+  output: string;
+  stdout: string;
+  stderr: string;
+  exit_code?: number;
+  outcome: "success" | "error" | "cancelled";
+  uuid: string;
+  session_id: string;
+}
+
+export type CLISystemMessage =
+  | CLISystemInitMessage
+  | CLISystemStatusMessage
+  | CLICompactBoundaryMessage
+  | CLITaskNotificationMessage
+  | CLIFilesPersistedMessage
+  | CLIHookStartedMessage
+  | CLIHookProgressMessage
+  | CLIHookResponseMessage;
+
 export interface CLIAssistantMessage {
   type: "assistant";
   message: {
@@ -147,8 +227,7 @@ export interface CLIControlResponseMessage {
 }
 
 export type CLIMessage =
-  | CLISystemInitMessage
-  | CLISystemStatusMessage
+  | CLISystemMessage
   | CLIAssistantMessage
   | CLIResultMessage
   | CLIStreamEventMessage
@@ -181,7 +260,8 @@ export type BrowserOutgoingMessage =
   | { type: "mcp_get_status"; client_msg_id?: string }
   | { type: "mcp_toggle"; serverName: string; enabled: boolean; client_msg_id?: string }
   | { type: "mcp_reconnect"; serverName: string; client_msg_id?: string }
-  | { type: "mcp_set_servers"; servers: Record<string, McpServerConfig>; client_msg_id?: string };
+  | { type: "mcp_set_servers"; servers: Record<string, McpServerConfig>; client_msg_id?: string }
+  | { type: "set_ai_validation"; aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null; client_msg_id?: string };
 
 /** Messages the bridge sends to the browser */
 export type BrowserIncomingMessageBase =
@@ -189,9 +269,21 @@ export type BrowserIncomingMessageBase =
   | { type: "session_update"; session: Partial<SessionState> }
   | { type: "assistant"; message: CLIAssistantMessage["message"]; parent_tool_use_id: string | null; timestamp?: number }
   | { type: "stream_event"; event: unknown; parent_tool_use_id: string | null }
+  | {
+    type: "system_event";
+    event:
+      | Pick<CLICompactBoundaryMessage, "subtype" | "compact_metadata" | "uuid" | "session_id">
+      | Pick<CLITaskNotificationMessage, "subtype" | "task_id" | "status" | "output_file" | "summary" | "uuid" | "session_id">
+      | Pick<CLIFilesPersistedMessage, "subtype" | "files" | "failed" | "processed_at" | "uuid" | "session_id">
+      | Pick<CLIHookStartedMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "uuid" | "session_id">
+      | Pick<CLIHookProgressMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "stdout" | "stderr" | "output" | "uuid" | "session_id">
+      | Pick<CLIHookResponseMessage, "subtype" | "hook_id" | "hook_name" | "hook_event" | "output" | "stdout" | "stderr" | "exit_code" | "outcome" | "uuid" | "session_id">;
+    timestamp?: number;
+  }
   | { type: "result"; data: CLIResultMessage }
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_cancelled"; request_id: string }
+  | { type: "permission_auto_resolved"; request: PermissionRequest; behavior: "allow" | "deny"; reason: string }
   | { type: "tool_progress"; tool_use_id: string; tool_name: string; elapsed_time_seconds: number }
   | { type: "tool_use_summary"; summary: string; tool_use_ids: string[] }
   | { type: "status_change"; status: "compacting" | "idle" | "running" | null }
@@ -260,6 +352,16 @@ export interface SessionState {
   cronJobId?: string;
   /** Human-readable name of the cron job that spawned this session */
   cronJobName?: string;
+  /** If this session was spawned by an agent */
+  agentId?: string;
+  /** Human-readable name of the agent that spawned this session */
+  agentName?: string;
+  /** Per-session AI validation override. null/undefined = use global default */
+  aiValidationEnabled?: boolean | null;
+  /** Per-session auto-approve override. null/undefined = use global default */
+  aiValidationAutoApprove?: boolean | null;
+  /** Per-session auto-deny override. null/undefined = use global default */
+  aiValidationAutoDeny?: boolean | null;
 }
 
 // ─── MCP Types ───────────────────────────────────────────────────────────────
@@ -296,6 +398,12 @@ export type PermissionUpdate =
   | { type: "addDirectories"; directories: string[]; destination: PermissionDestination }
   | { type: "removeDirectories"; directories: string[]; destination: PermissionDestination };
 
+export interface AiValidationInfo {
+  verdict: "safe" | "dangerous" | "uncertain";
+  reason: string;
+  ruleBasedOnly: boolean;
+}
+
 export interface PermissionRequest {
   request_id: string;
   tool_name: string;
@@ -305,6 +413,7 @@ export interface PermissionRequest {
   tool_use_id: string;
   agent_id?: string;
   timestamp: number;
+  ai_validation?: AiValidationInfo;
 }
 
 // ─── Session Creation Progress (SSE streaming) ──────────────────────────────

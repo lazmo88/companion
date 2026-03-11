@@ -40,9 +40,9 @@ export function toModelOptions(models: BackendModelInfo[]): ModelOption[] {
 // ─── Static fallbacks ────────────────────────────────────────────────────────
 
 export const CLAUDE_MODELS: ModelOption[] = [
-  { value: "claude-opus-4-6", label: "Opus", icon: "\u2733" },
-  { value: "claude-sonnet-4-6", label: "Sonnet", icon: "\u25D5" },
-  { value: "claude-haiku-4-5-20251001", label: "Haiku", icon: "\u26A1" },
+  { value: "claude-opus-4-6", label: "Opus 4.6", icon: "" },
+  { value: "claude-sonnet-4-6", label: "Sonnet 4.6", icon: "" },
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5", icon: "" },
 ];
 
 export const CODEX_MODELS: ModelOption[] = [
@@ -63,6 +63,19 @@ export const CODEX_MODES: ModeOption[] = [
   { value: "plan", label: "Plan" },
 ];
 
+// Agent-specific modes: "plan" is excluded because agents are autonomous
+// and cannot wait for human plan approval.
+export const CLAUDE_AGENT_MODES: ModeOption[] = [
+  { value: "bypassPermissions", label: "Full Auto" },
+  { value: "acceptEdits", label: "Auto-Edit" },
+  { value: "default", label: "Supervised" },
+];
+
+export const CODEX_AGENT_MODES: ModeOption[] = [
+  { value: "bypassPermissions", label: "Full Auto" },
+  { value: "default", label: "Supervised" },
+];
+
 // ─── Getters ─────────────────────────────────────────────────────────────────
 
 export function getModelsForBackend(backend: BackendType): ModelOption[] {
@@ -73,10 +86,18 @@ export function getModesForBackend(backend: BackendType): ModeOption[] {
   return backend === "codex" ? CODEX_MODES : CLAUDE_MODES;
 }
 
+export function getAgentModesForBackend(backend: BackendType): ModeOption[] {
+  return backend === "codex" ? CODEX_AGENT_MODES : CLAUDE_AGENT_MODES;
+}
+
 export function getDefaultModel(backend: BackendType): string {
   return backend === "codex" ? CODEX_MODELS[0].value : CLAUDE_MODELS[0].value;
 }
 
 export function getDefaultMode(backend: BackendType): string {
   return backend === "codex" ? CODEX_MODES[0].value : CLAUDE_MODES[0].value;
+}
+
+export function getDefaultAgentMode(backend: BackendType): string {
+  return backend === "codex" ? CODEX_AGENT_MODES[0].value : CLAUDE_AGENT_MODES[0].value;
 }

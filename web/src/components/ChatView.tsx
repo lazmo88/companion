@@ -5,9 +5,12 @@ import { captureException } from "../analytics.js";
 import { MessageFeed } from "./MessageFeed.js";
 import { Composer } from "./Composer.js";
 import { PermissionBanner } from "./PermissionBanner.js";
+import { AiValidationBadge } from "./AiValidationBadge.js";
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const sessionPerms = useStore((s) => s.pendingPermissions.get(sessionId));
+  const aiResolved = useStore((s) => s.aiResolvedPermissions.get(sessionId));
+  const clearAiResolvedPermissions = useStore((s) => s.clearAiResolvedPermissions);
   const connStatus = useStore(
     (s) => s.connectionStatus.get(sessionId) ?? "disconnected"
   );
@@ -28,7 +31,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           </span>
           <button
             onClick={() => api.relaunchSession(sessionId).catch(captureException)}
-            className="text-xs font-medium px-3 py-1 rounded-md bg-cc-warning/20 hover:bg-cc-warning/30 text-cc-warning transition-colors cursor-pointer"
+            className="text-xs font-medium px-3 py-2 rounded-md bg-cc-warning/20 hover:bg-cc-warning/30 text-cc-warning transition-colors cursor-pointer"
           >
             Reconnect
           </button>
@@ -46,6 +49,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       {/* Message feed */}
       <MessageFeed sessionId={sessionId} />
+
+      {/* AI auto-resolved notification (most recent only) */}
+      {aiResolved && aiResolved.length > 0 && (
+        <div className="shrink-0 border-t border-cc-border bg-cc-card">
+          <AiValidationBadge
+            entry={aiResolved[aiResolved.length - 1]}
+            onDismiss={() => clearAiResolvedPermissions(sessionId)}
+          />
+        </div>
+      )}
 
       {/* Permission banners */}
       {perms.length > 0 && (

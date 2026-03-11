@@ -7,6 +7,7 @@ import type {
   BufferedBrowserEvent,
 } from "./session-types.js";
 import type { CodexAdapter } from "./codex-adapter.js";
+import { getSettings } from "./settings-manager.js";
 
 export interface CLISocketData {
   kind: "cli";
@@ -25,7 +26,12 @@ export interface TerminalSocketData {
   terminalId: string;
 }
 
-export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData;
+export interface NoVncSocketData {
+  kind: "novnc";
+  sessionId: string;
+}
+
+export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData | NoVncSocketData;
 
 /** Tracks a pending control_request sent to CLI that expects a control_response. */
 export interface PendingControlRequest {
@@ -49,6 +55,11 @@ export interface Session {
   lastAckSeq: number;
   processedClientMessageIds: string[];
   processedClientMessageIdSet: Set<string>;
+  /** Rolling set of recent CLI message hashes for deduplication on WS reconnect */
+  recentCLIMessageHashes: string[];
+  recentCLIMessageHashSet: Set<string>;
+  /** Timestamp of last non-keepalive CLI message (for idle detection) */
+  lastCliActivityTs: number;
 }
 
 export type GitSessionKey =
@@ -87,5 +98,8 @@ export function makeDefaultState(
     git_behind: 0,
     total_lines_added: 0,
     total_lines_removed: 0,
+    aiValidationEnabled: getSettings().aiValidationEnabled,
+    aiValidationAutoApprove: getSettings().aiValidationAutoApprove,
+    aiValidationAutoDeny: getSettings().aiValidationAutoDeny,
   };
 }

@@ -4,6 +4,20 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Hono } from "hono";
 
+/** Ensure a resolved path is within one of the allowed base directories.
+ *  Returns the resolved absolute path, or null if it escapes all bases. */
+function guardPath(raw: string, allowedBases: string[]): string | null {
+  const abs = resolve(raw);
+  for (const base of allowedBases) {
+    if (abs === base || abs.startsWith(base + "/")) return abs;
+  }
+  return null;
+}
+
+function shellEscapeArg(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function execCaptureStdout(
   command: string,
   options: { cwd: string; encoding: "utf-8"; timeout: number },
@@ -44,10 +58,15 @@ function resolveBranchDiffBases(repoRoot: string): string[] {
   return ["main"];
 }
 
-export function registerFsRoutes(api: Hono): void {
+export function registerFsRoutes(api: Hono, opts?: { allowedBases?: string[] }): void {
+  // Allowed base directories for filesystem access.
+  // Requests must target paths under the user's home directory or process cwd.
+  const allowedBases = () => opts?.allowedBases ?? [homedir(), process.cwd()];
+
   api.get("/fs/list", async (c) => {
     const rawPath = c.req.query("path") || homedir();
-    const basePath = resolve(rawPath);
+    const basePath = guardPath(rawPath, allowedBases());
+    if (!basePath) return c.json({ error: "Path outside allowed directories" }, 403);
     try {
       const entries = await readdir(basePath, { withFileTypes: true });
       const dirs: { name: string; path: string }[] = [];
@@ -86,7 +105,8 @@ export function registerFsRoutes(api: Hono): void {
   api.get("/fs/tree", async (c) => {
     const rawPath = c.req.query("path");
     if (!rawPath) return c.json({ error: "path required" }, 400);
-    const basePath = resolve(rawPath);
+    const basePath = guardPath(rawPath, allowedBases());
+    if (!basePath) return c.json({ error: "Path outside allowed directories" }, 403);
 
     interface TreeNode {
       name: string;
@@ -132,7 +152,8 @@ export function registerFsRoutes(api: Hono): void {
   api.get("/fs/read", async (c) => {
     const filePath = c.req.query("path");
     if (!filePath) return c.json({ error: "path required" }, 400);
-    const absPath = resolve(filePath);
+    const absPath = guardPath(filePath, allowedBases());
+    if (!absPath) return c.json({ error: "Path outside allowed directories" }, 403);
     try {
       const info = await stat(absPath);
       if (info.size > 2 * 1024 * 1024) {
@@ -148,13 +169,48 @@ export function registerFsRoutes(api: Hono): void {
     }
   });
 
+  api.get("/fs/raw", async (c) => {
+    const filePath = c.req.query("path");
+    if (!filePath) return c.json({ error: "path required" }, 400);
+    const absPath = guardPath(filePath, allowedBases());
+    if (!absPath) return c.json({ error: "Path outside allowed directories" }, 403);
+    try {
+      const info = await stat(absPath);
+      if (info.size > 10 * 1024 * 1024) {
+        return c.json({ error: "File too large (>10MB)" }, 413);
+      }
+    } catch (e: unknown) {
+      return c.json({ error: e instanceof Error ? e.message : "File not found" }, 404);
+    }
+    try {
+      const buffer = await readFile(absPath);
+      const ext = absPath.split(".").pop()?.toLowerCase() ?? "";
+      const mimeMap: Record<string, string> = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+        avif: "image/avif", ico: "image/x-icon", bmp: "image/bmp",
+        tiff: "image/tiff", tif: "image/tiff",
+      };
+      const contentType = mimeMap[ext] || "application/octet-stream";
+      return new Response(buffer, {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "private, max-age=60",
+        },
+      });
+    } catch (e: unknown) {
+      return c.json({ error: e instanceof Error ? e.message : "Cannot read file" }, 404);
+    }
+  });
+
   api.put("/fs/write", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { path: filePath, content } = body;
     if (!filePath || typeof content !== "string") {
       return c.json({ error: "path and content required" }, 400);
     }
-    const absPath = resolve(filePath);
+    const absPath = guardPath(filePath, allowedBases());
+    if (!absPath) return c.json({ error: "Path outside allowed directories" }, 403);
     try {
       await writeFile(absPath, content, "utf-8");
       return c.json({ ok: true, path: absPath });
@@ -231,26 +287,294 @@ export function registerFsRoutes(api: Hono): void {
     }
   });
 
+  /** List all files changed vs git base (name-status), including untracked new files.
+   *  base="default-branch" (default): comprehensive — committed changes on this branch vs origin
+   *  plus uncommitted local changes.
+   *  base="last-commit": only uncommitted changes vs HEAD plus untracked files. */
+  api.get("/fs/changed-files", (c) => {
+    const cwd = c.req.query("cwd");
+    if (!cwd) return c.json({ error: "cwd required" }, 400);
+    const base = c.req.query("base"); // "last-commit" | "default-branch" | undefined
+    const resolvedCwd = resolve(cwd);
+    try {
+      const repoRoot = execSync("git rev-parse --show-toplevel", {
+        cwd: resolvedCwd,
+        encoding: "utf-8",
+        timeout: 5000,
+      }).trim();
+
+      // Map from abs path → status ("A", "M", "D"). Later writes win, but "A" is preserved.
+      const fileMap = new Map<string, string>();
+
+      const applyNameStatus = (nameStatus: string) => {
+        for (const line of nameStatus.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const parts = trimmed.split("\t");
+          const statusChar = parts[0][0];
+          if (statusChar === "R" && parts[2]) {
+            if (!fileMap.has(join(repoRoot, parts[1]))) fileMap.set(join(repoRoot, parts[1]), "D");
+            fileMap.set(join(repoRoot, parts[2]), "A");
+          } else {
+            const abs = join(repoRoot, parts[1] || "");
+            if (!abs || abs === repoRoot) continue;
+            // Preserve "A" — don't downgrade to "M"
+            if (!(fileMap.get(abs) === "A" && statusChar === "M")) {
+              fileMap.set(abs, statusChar);
+            }
+          }
+        }
+      };
+
+      if (base !== "last-commit") {
+        // default-branch (or unset): committed changes on this branch vs origin base
+        const diffBases = resolveBranchDiffBases(repoRoot);
+        for (const b of diffBases) {
+          try {
+            applyNameStatus(execCaptureStdout(`git diff ${shellEscapeArg(b)}...HEAD --name-status`, {
+              cwd: repoRoot, encoding: "utf-8", timeout: 5000,
+            }));
+            break;
+          } catch { /* try next */ }
+        }
+      }
+
+      // Always include uncommitted changes (staged + unstaged vs HEAD)
+      try {
+        applyNameStatus(execCaptureStdout("git diff HEAD --name-status", {
+          cwd: repoRoot, encoding: "utf-8", timeout: 5000,
+        }));
+      } catch { /* fresh repo */ }
+
+      // Always include untracked files not yet staged
+      try {
+        const untracked = execSync("git ls-files --others --exclude-standard", {
+          cwd: repoRoot, encoding: "utf-8", timeout: 5000,
+        }).trim();
+        for (const rel of untracked.split("\n")) {
+          if (rel.trim()) {
+            const abs = join(repoRoot, rel.trim());
+            if (!fileMap.has(abs)) fileMap.set(abs, "A");
+          }
+        }
+      } catch { /* ignore */ }
+
+      const files = [...fileMap.entries()].map(([path, status]) => ({ path, status }));
+      return c.json({ files });
+    } catch {
+      return c.json({ files: [] });
+    }
+  });
+
+  /** Find CLAUDE.md files for a project (root + .claude/) */
   api.get("/fs/claude-md", async (c) => {
     const cwd = c.req.query("cwd");
     if (!cwd) return c.json({ error: "cwd required" }, 400);
     const resolvedCwd = resolve(cwd);
-    const candidates = [
-      join(resolvedCwd, "CLAUDE.md"),
-      join(resolvedCwd, ".claude", "CLAUDE.md"),
-    ];
 
+    // Find the git repo root so we can search upward from cwd.
+    let repoRoot: string | null = null;
+    try {
+      repoRoot = execSync("git rev-parse --show-toplevel", {
+        cwd: resolvedCwd,
+        encoding: "utf-8",
+        timeout: 3000,
+      }).trim();
+    } catch {
+      // Not a git repo — only search the exact cwd
+    }
+
+    // Collect candidate directories: cwd, then each parent up to repo root.
+    const searchDirs: string[] = [];
+    let dir = resolvedCwd;
+    const stop = repoRoot ? resolve(repoRoot) : resolvedCwd;
+    while (true) {
+      searchDirs.push(dir);
+      if (dir === stop) break;
+      const parent = dirname(dir);
+      if (parent === dir) break; // filesystem root
+      dir = parent;
+    }
+
+    // Check CLAUDE.md and .claude/CLAUDE.md in each directory.
+    const seen = new Set<string>();
     const files: { path: string; content: string }[] = [];
-    for (const p of candidates) {
-      try {
-        const content = await readFile(p, "utf-8");
-        files.push({ path: p, content });
-      } catch {
-        // file doesn't exist — skip
+    for (const d of searchDirs) {
+      for (const rel of ["CLAUDE.md", join(".claude", "CLAUDE.md")]) {
+        const p = join(d, rel);
+        if (seen.has(p)) continue;
+        seen.add(p);
+        try {
+          const content = await readFile(p, "utf-8");
+          files.push({ path: p, content });
+        } catch {
+          // file doesn't exist — skip
+        }
       }
     }
 
     return c.json({ cwd: resolvedCwd, files });
+  });
+
+  api.get("/fs/claude-config", async (c) => {
+    const cwd = c.req.query("cwd");
+    if (!cwd) return c.json({ error: "cwd required" }, 400);
+    const resolvedCwd = resolve(cwd);
+
+    // Find repo root
+    let repoRoot: string | null = null;
+    try {
+      repoRoot = execSync("git rev-parse --show-toplevel", {
+        cwd: resolvedCwd,
+        encoding: "utf-8",
+        timeout: 3000,
+      }).trim();
+    } catch {
+      // Not a git repo
+    }
+    const projectRoot = repoRoot ? resolve(repoRoot) : resolvedCwd;
+
+    // ── Project-level items ─────────────────────────────────────────────
+    // CLAUDE.md files — reuse walk-up logic
+    const searchDirs: string[] = [];
+    let dir = resolvedCwd;
+    const stop = projectRoot;
+    while (true) {
+      searchDirs.push(dir);
+      if (dir === stop) break;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    const seen = new Set<string>();
+    const projectClaudeMd: { path: string; content: string }[] = [];
+    for (const d of searchDirs) {
+      for (const rel of ["CLAUDE.md", join(".claude", "CLAUDE.md")]) {
+        const p = join(d, rel);
+        if (seen.has(p)) continue;
+        seen.add(p);
+        try {
+          const content = await readFile(p, "utf-8");
+          projectClaudeMd.push({ path: p, content });
+        } catch {
+          // file doesn't exist
+        }
+      }
+    }
+
+    // settings.json / settings.local.json
+    const claudeDir = join(projectRoot, ".claude");
+    let projectSettings: { path: string; content: string } | null = null;
+    let projectSettingsLocal: { path: string; content: string } | null = null;
+    try {
+      const p = join(claudeDir, "settings.json");
+      projectSettings = { path: p, content: await readFile(p, "utf-8") };
+    } catch { /* missing */ }
+    try {
+      const p = join(claudeDir, "settings.local.json");
+      projectSettingsLocal = { path: p, content: await readFile(p, "utf-8") };
+    } catch { /* missing */ }
+
+    // commands/*.md
+    const projectCommands: { name: string; path: string }[] = [];
+    try {
+      const commandsDir = join(claudeDir, "commands");
+      const entries = await readdir(commandsDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith(".md")) {
+          projectCommands.push({ name: e.name.replace(/\.md$/, ""), path: join(commandsDir, e.name) });
+        }
+      }
+      projectCommands.sort((a, b) => a.name.localeCompare(b.name));
+    } catch { /* missing dir */ }
+
+    // ── User-level items ────────────────────────────────────────────────
+    const userRoot = join(homedir(), ".claude");
+
+    // User CLAUDE.md
+    let userClaudeMd: { path: string; content: string } | null = null;
+    try {
+      const p = join(userRoot, "CLAUDE.md");
+      userClaudeMd = { path: p, content: await readFile(p, "utf-8") };
+    } catch { /* missing */ }
+
+    // Skills
+    const userSkills: { slug: string; name: string; description: string; path: string }[] = [];
+    try {
+      const skillsDir = join(userRoot, "skills");
+      const entries = await readdir(skillsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillMdPath = join(skillsDir, entry.name, "SKILL.md");
+        try {
+          const content = await readFile(skillMdPath, "utf-8");
+          const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+          let name = entry.name;
+          let description = "";
+          if (fmMatch) {
+            for (const line of fmMatch[1].split("\n")) {
+              const nameMatch = line.match(/^name:\s*(.+)/);
+              if (nameMatch) name = nameMatch[1].trim().replace(/^["']|["']$/g, "");
+              const descMatch = line.match(/^description:\s*["']?(.+?)["']?\s*$/);
+              if (descMatch) description = descMatch[1];
+            }
+          }
+          userSkills.push({ slug: entry.name, name, description, path: skillMdPath });
+        } catch { /* no SKILL.md */ }
+      }
+      userSkills.sort((a, b) => a.name.localeCompare(b.name));
+    } catch { /* missing dir */ }
+
+    // Agents
+    const userAgents: { name: string; path: string }[] = [];
+    try {
+      const agentsDir = join(userRoot, "agents");
+      const entries = await readdir(agentsDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith(".md")) {
+          userAgents.push({ name: e.name.replace(/\.md$/, ""), path: join(agentsDir, e.name) });
+        }
+      }
+      userAgents.sort((a, b) => a.name.localeCompare(b.name));
+    } catch { /* missing dir */ }
+
+    // User settings.json
+    let userSettings: { path: string; content: string } | null = null;
+    try {
+      const p = join(userRoot, "settings.json");
+      userSettings = { path: p, content: await readFile(p, "utf-8") };
+    } catch { /* missing */ }
+
+    // User commands/*.md
+    const userCommands: { name: string; path: string }[] = [];
+    try {
+      const commandsDir = join(userRoot, "commands");
+      const entries = await readdir(commandsDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith(".md")) {
+          userCommands.push({ name: e.name.replace(/\.md$/, ""), path: join(commandsDir, e.name) });
+        }
+      }
+      userCommands.sort((a, b) => a.name.localeCompare(b.name));
+    } catch { /* missing dir */ }
+
+    return c.json({
+      project: {
+        root: projectRoot,
+        claudeMd: projectClaudeMd,
+        settings: projectSettings,
+        settingsLocal: projectSettingsLocal,
+        commands: projectCommands,
+      },
+      user: {
+        root: userRoot,
+        claudeMd: userClaudeMd,
+        skills: userSkills,
+        agents: userAgents,
+        settings: userSettings,
+        commands: userCommands,
+      },
+    });
   });
 
   api.put("/fs/claude-md", async (c) => {
