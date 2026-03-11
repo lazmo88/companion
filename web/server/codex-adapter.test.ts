@@ -3470,12 +3470,9 @@ describe("CodexAdapter with ICodexTransport", () => {
     mock2.resolveCall(1, { userAgent: "codex" });
     await new Promise((r) => setTimeout(r, 20));
 
-    // Should call thread/resume since threadId was preserved from first init
-    // (the adapter sets options.threadId from the previous threadId)
-    // Actually: resetForReconnect doesn't update options.threadId, it uses
-    // the existing this.threadId which was set. But initialize() checks
-    // this.options.threadId, not this.threadId. So it will do thread/start.
-    // This is fine — the new thread/start will create a new thread.
+    // Should call thread/resume since threadId was preserved from first init.
+    expect(mock2.calls[1]?.method).toBe("thread/resume");
+    expect(mock2.calls[1]?.params).toMatchObject({ threadId: "thr_first" });
     mock2.resolveCall(2, { thread: { id: "thr_reconnected" } });
     await new Promise((r) => setTimeout(r, 50));
     mock2.resolveCall(3, {}); // rateLimits

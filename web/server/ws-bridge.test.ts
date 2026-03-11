@@ -984,6 +984,37 @@ describe("Browser handlers", () => {
     expect(disconnectedMsg).toBeUndefined();
   });
 
+  it("queues Codex user messages and requests relaunch when attached adapter rejects them", () => {
+    const relaunchCb = vi.fn();
+    bridge.onCLIRelaunchNeededCallback(relaunchCb);
+
+    const session = bridge.getOrCreateSession("s1", "codex");
+    session.codexAdapter = {
+      sendBrowserMessage: vi.fn(() => false),
+      isConnected: () => false,
+    } as any;
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleBrowserMessage(browser, JSON.stringify({
+      type: "user_message",
+      content: "hello after freeze",
+      client_msg_id: "cmsg-codex-reject-1",
+    }));
+
+    expect(session.codexAdapter.sendBrowserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "user_message", content: "hello after freeze" }),
+    );
+    expect(session.pendingMessages).toHaveLength(1);
+    expect(JSON.parse(session.pendingMessages[0])).toMatchObject({
+      type: "user_message",
+      content: "hello after freeze",
+    });
+    expect(relaunchCb).toHaveBeenCalledWith("s1");
+  });
+
   it("handleBrowserClose: removes from set", () => {
     const browser = makeBrowserSocket("s1");
     bridge.handleBrowserOpen(browser, "s1");

@@ -560,6 +560,7 @@ export class CodexAdapter {
     this.initialized = false;
     this.initFailed = false;
     this.initInProgress = false;
+    this.options.threadId = this.threadId ?? this.options.threadId;
 
     // Re-wire handlers on the new transport
     this.transport.onNotification((method, params) => this.handleNotification(method, params));

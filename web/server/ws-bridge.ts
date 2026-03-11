@@ -1221,7 +1221,18 @@ export class WsBridge {
       }
 
       if (session.codexAdapter) {
-        session.codexAdapter.sendBrowserMessage(msg);
+        const accepted = session.codexAdapter.sendBrowserMessage(msg);
+        if (!accepted) {
+          // A stale or half-initialized Codex adapter can reject messages even
+          // while still attached to the session. Queue the message so it
+          // survives the ensuing relaunch instead of dropping it silently.
+          console.warn(`[ws-bridge] Codex adapter rejected ${msg.type} for session ${session.id}; queuing for relaunch`);
+          session.pendingMessages.push(JSON.stringify(msg));
+          this.persistSession(session);
+          if (this.onCLIRelaunchNeeded) {
+            this.onCLIRelaunchNeeded(session.id);
+          }
+        }
       } else {
         // Adapter not yet attached — queue for when it's ready.
         // The adapter itself also queues during init, but this covers
