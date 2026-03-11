@@ -99,8 +99,8 @@ interface CodexWebSearchItem extends CodexItem {
 
 interface CodexReasoningItem extends CodexItem {
   type: "reasoning";
-  summary?: string;
-  content?: string;
+  summary?: unknown;
+  content?: unknown;
 }
 
 interface CodexContextCompactionItem extends CodexItem {
@@ -1874,6 +1874,39 @@ export class CodexAdapter {
     return null;
   }
 
+  private extractReasoningText(value: unknown): string {
+    if (typeof value === "string") {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value
+        .map((part) => this.extractReasoningText(part))
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+    }
+
+    if (!value || typeof value !== "object") {
+      return "";
+    }
+
+    const obj = value as Record<string, unknown>;
+    const direct = this.firstString(obj, ["text", "summary", "content", "title", "label"]);
+    if (direct) {
+      return direct;
+    }
+
+    for (const key of ["parts", "items", "value", "data"]) {
+      const nested = this.extractReasoningText(obj[key]);
+      if (nested) {
+        return nested;
+      }
+    }
+
+    return "";
+  }
+
   private normalizePlanStatus(statusRaw: string | null): "pending" | "in_progress" | "completed" {
     const status = (statusRaw || "").toLowerCase();
     if (
@@ -2045,11 +2078,11 @@ export class CodexAdapter {
 
       case "reasoning": {
         const r = item as CodexReasoningItem;
-        const thinkingText = (
+        const thinkingText = this.extractReasoningText(
           this.reasoningTextByItemId.get(item.id)
           || r.summary
           || r.content
-          || ""
+          || "",
         ).trim();
 
         if (thinkingText) {

@@ -3149,6 +3149,44 @@ describe("CodexAdapter", () => {
     const stopEvents = streamEvents.filter((e) => e.event.type === "content_block_stop");
     expect(stopEvents.length).toBeGreaterThanOrEqual(1);
   });
+
+  it("handles reasoning completion when summary is a structured array", async () => {
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 50));
+    stdout.push(JSON.stringify({ id: 1, result: { userAgent: "codex" } }) + "\n");
+    await new Promise((r) => setTimeout(r, 20));
+    stdout.push(JSON.stringify({ id: 2, result: { thread: { id: "thr_123" } } }) + "\n");
+    await new Promise((r) => setTimeout(r, 50));
+
+    stdout.push(JSON.stringify({
+      method: "item/started",
+      params: { item: { type: "reasoning", id: "r_structured_1" } },
+    }) + "\n");
+    await new Promise((r) => setTimeout(r, 20));
+
+    stdout.push(JSON.stringify({
+      method: "item/completed",
+      params: {
+        item: {
+          type: "reasoning",
+          id: "r_structured_1",
+          summary: [{ text: "Structured reasoning summary." }],
+        },
+      },
+    }) + "\n");
+    await new Promise((r) => setTimeout(r, 50));
+
+    const thinkingMsg = messages.find((m) =>
+      m.type === "assistant"
+      && (m as { message?: { content?: Array<{ type: string; thinking?: string }> } }).message?.content?.some(
+        (block) => block.type === "thinking" && block.thinking?.includes("Structured reasoning summary."),
+      ),
+    );
+    expect(thinkingMsg).toBeDefined();
+  });
 });
 
 // ─── ICodexTransport-based tests ──────────────────────────────────────────────
