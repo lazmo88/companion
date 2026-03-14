@@ -1,6 +1,6 @@
 import { getSettings, DEFAULT_ANTHROPIC_MODEL } from "./settings-manager.js";
 
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_URL = process.env.COMPANION_AI_VALIDATION_URL || "https://api.anthropic.com/v1/messages";
 const AI_TIMEOUT_MS = 5_000;
 
 export type AiVerdict = "safe" | "dangerous" | "uncertain";
@@ -146,19 +146,107 @@ async function formatHttpErrorReason(res: Response): Promise<string> {
 /**
  * Call the AI model via Anthropic to evaluate a tool call.
  */
+async function aiEvaluateAnthropic(
+  userPrompt: string,
+  apiKey: string,
+  model: string,
+  controller: AbortController,
+): Promise<AiValidationResult> {
+  const res = await fetch(ANTHROPIC_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 256,
+      system: SYSTEM_PROMPT,
+      messages: [
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0,
+    }),
+    signal: controller.signal,
+  });
+
+  if (!res.ok) {
+    const reason = await formatHttpErrorReason(res);
+    console.warn(`[ai-validator] Anthropic request failed: ${res.status} ${res.statusText} — ${reason}`);
+    return { verdict: "uncertain", reason, ruleBasedOnly: false };
+  }
+
+  const data = (await res.json()) as {
+    content?: Array<{ type: string; text?: string }>;
+  };
+
+  const raw = data.content?.[0]?.type === "text"
+    ? (data.content[0].text ?? "")
+    : "";
+
+  return parseAiResponse(raw);
+}
+
+/**
+ * Call the AI model via OpenAI-compatible API (OpenAI, LiteLLM, Ollama, vLLM) to evaluate a tool call.
+ */
+async function aiEvaluateOpenAI(
+  userPrompt: string,
+  apiKey: string,
+  model: string,
+  baseUrl: string,
+  controller: AbortController,
+): Promise<AiValidationResult> {
+  const url = baseUrl.replace(/\/$/, "") + "/chat/completions";
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+      max_tokens: 256,
+      temperature: 0,
+    }),
+    signal: controller.signal,
+  });
+
+  if (!res.ok) {
+    const reason = await formatHttpErrorReason(res);
+    console.warn(`[ai-validator] OpenAI-compatible request failed: ${res.status} ${res.statusText} — ${reason}`);
+    return { verdict: "uncertain", reason, ruleBasedOnly: false };
+  }
+
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+
+  const raw = data.choices?.[0]?.message?.content ?? "";
+
+  return parseAiResponse(raw);
+}
+
+/**
+ * Dispatch AI evaluation to the configured provider.
+ */
 export async function aiEvaluate(
   toolName: string,
   input: Record<string, unknown>,
   description?: string,
 ): Promise<AiValidationResult> {
   const settings = getSettings();
-  const apiKey = settings.anthropicApiKey.trim();
-
-  if (!apiKey) {
-    return { verdict: "uncertain", reason: "No Anthropic API key configured", ruleBasedOnly: false };
-  }
-
-  const model = settings.anthropicModel?.trim() || DEFAULT_ANTHROPIC_MODEL;
+  const provider = settings.aiValidationProvider || "anthropic";
 
   // Build a concise representation of the tool call for the AI
   const inputStr = JSON.stringify(input, null, 0);
@@ -172,40 +260,31 @@ export async function aiEvaluate(
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
   try {
-    const res = await fetch(ANTHROPIC_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 256,
-        system: SYSTEM_PROMPT,
-        messages: [
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const reason = await formatHttpErrorReason(res);
-      console.warn(`[ai-validator] Anthropic request failed: ${res.status} ${res.statusText} — ${reason}`);
-      return { verdict: "uncertain", reason, ruleBasedOnly: false };
+    if (provider === "openai") {
+      const apiKey = settings.aiValidationApiKey.trim();
+      if (!apiKey) {
+        return { verdict: "uncertain", reason: "No OpenAI API key configured", ruleBasedOnly: false };
+      }
+      const model = settings.aiValidationModel.trim() || "gpt-4o-mini";
+      const baseUrl = settings.aiValidationBaseUrl.trim() || "https://api.openai.com/v1";
+      return await aiEvaluateOpenAI(userPrompt, apiKey, model, baseUrl, controller);
+    } else if (provider === "custom") {
+      const baseUrl = settings.aiValidationBaseUrl.trim();
+      if (!baseUrl) {
+        return { verdict: "uncertain", reason: "No custom AI base URL configured", ruleBasedOnly: false };
+      }
+      const apiKey = settings.aiValidationApiKey.trim();
+      const model = settings.aiValidationModel.trim() || "default";
+      return await aiEvaluateOpenAI(userPrompt, apiKey, model, baseUrl, controller);
+    } else {
+      // Default: anthropic
+      const apiKey = settings.anthropicApiKey.trim() || (process.env.COMPANION_AI_VALIDATION_URL ? "sdk-bridge" : "");
+      if (!apiKey) {
+        return { verdict: "uncertain", reason: "No Anthropic API key configured", ruleBasedOnly: false };
+      }
+      const model = settings.anthropicModel?.trim() || DEFAULT_ANTHROPIC_MODEL;
+      return await aiEvaluateAnthropic(userPrompt, apiKey, model, controller);
     }
-
-    const data = (await res.json()) as {
-      content?: Array<{ type: string; text?: string }>;
-    };
-
-    const raw = data.content?.[0]?.type === "text"
-      ? (data.content[0].text ?? "")
-      : "";
-
-    return parseAiResponse(raw);
   } catch (err) {
     const isAbort = err instanceof Error && err.name === "AbortError";
     const errMsg = err instanceof Error ? err.message : String(err);

@@ -8,7 +8,7 @@ export function registerSettingsRoutes(api: Hono): void {
     const settings = getSettings();
     const connections = listConnections();
     return c.json({
-      anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim(),
+      anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim() || !!process.env.COMPANION_AI_VALIDATION_URL,
       anthropicModel: settings.anthropicModel || DEFAULT_ANTHROPIC_MODEL,
       linearApiKeyConfigured: !!settings.linearApiKey.trim() || connections.length > 0,
       linearConnectionCount: connections.length,
@@ -22,6 +22,10 @@ export function registerSettingsRoutes(api: Hono): void {
       aiValidationEnabled: settings.aiValidationEnabled,
       aiValidationAutoApprove: settings.aiValidationAutoApprove,
       aiValidationAutoDeny: settings.aiValidationAutoDeny,
+      aiValidationProvider: settings.aiValidationProvider,
+      aiValidationBaseUrl: settings.aiValidationBaseUrl,
+      aiValidationApiKeyConfigured: !!settings.aiValidationApiKey.trim(),
+      aiValidationModel: settings.aiValidationModel,
       publicUrl: settings.publicUrl,
       updateChannel: settings.updateChannel,
     });
@@ -80,6 +84,18 @@ export function registerSettingsRoutes(api: Hono): void {
     if (body.updateChannel !== undefined && body.updateChannel !== "stable" && body.updateChannel !== "prerelease") {
       return c.json({ error: "updateChannel must be 'stable' or 'prerelease'" }, 400);
     }
+    if (body.aiValidationProvider !== undefined && typeof body.aiValidationProvider !== "string") {
+      return c.json({ error: "aiValidationProvider must be a string" }, 400);
+    }
+    if (body.aiValidationBaseUrl !== undefined && typeof body.aiValidationBaseUrl !== "string") {
+      return c.json({ error: "aiValidationBaseUrl must be a string" }, 400);
+    }
+    if (body.aiValidationApiKey !== undefined && typeof body.aiValidationApiKey !== "string") {
+      return c.json({ error: "aiValidationApiKey must be a string" }, 400);
+    }
+    if (body.aiValidationModel !== undefined && typeof body.aiValidationModel !== "string") {
+      return c.json({ error: "aiValidationModel must be a string" }, 400);
+    }
     if (body.linearOAuthClientId !== undefined && typeof body.linearOAuthClientId !== "string") {
       return c.json({ error: "linearOAuthClientId must be a string" }, 400);
     }
@@ -99,6 +115,8 @@ export function registerSettingsRoutes(api: Hono): void {
       || body.editorTabEnabled !== undefined
       || body.aiValidationEnabled !== undefined || body.aiValidationAutoApprove !== undefined
       || body.aiValidationAutoDeny !== undefined
+      || body.aiValidationProvider !== undefined || body.aiValidationBaseUrl !== undefined
+      || body.aiValidationApiKey !== undefined || body.aiValidationModel !== undefined
       || body.publicUrl !== undefined
       || body.updateChannel !== undefined;
     if (!hasAnyField) {
@@ -174,6 +192,22 @@ export function registerSettingsRoutes(api: Hono): void {
         typeof body.aiValidationAutoDeny === "boolean"
           ? body.aiValidationAutoDeny
           : undefined,
+      aiValidationProvider:
+        typeof body.aiValidationProvider === "string"
+          ? body.aiValidationProvider.trim()
+          : undefined,
+      aiValidationBaseUrl:
+        typeof body.aiValidationBaseUrl === "string"
+          ? body.aiValidationBaseUrl.trim()
+          : undefined,
+      aiValidationApiKey:
+        typeof body.aiValidationApiKey === "string"
+          ? body.aiValidationApiKey.trim()
+          : undefined,
+      aiValidationModel:
+        typeof body.aiValidationModel === "string"
+          ? body.aiValidationModel.trim()
+          : undefined,
       publicUrl:
         typeof body.publicUrl === "string"
           ? body.publicUrl.trim().replace(/\/+$/, "")
@@ -186,7 +220,7 @@ export function registerSettingsRoutes(api: Hono): void {
 
     const connectionsAfterUpdate = listConnections();
     return c.json({
-      anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim(),
+      anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim() || !!process.env.COMPANION_AI_VALIDATION_URL,
       anthropicModel: settings.anthropicModel || DEFAULT_ANTHROPIC_MODEL,
       linearApiKeyConfigured: !!settings.linearApiKey.trim() || connectionsAfterUpdate.length > 0,
       linearConnectionCount: connectionsAfterUpdate.length,
@@ -200,6 +234,10 @@ export function registerSettingsRoutes(api: Hono): void {
       aiValidationEnabled: settings.aiValidationEnabled,
       aiValidationAutoApprove: settings.aiValidationAutoApprove,
       aiValidationAutoDeny: settings.aiValidationAutoDeny,
+      aiValidationProvider: settings.aiValidationProvider,
+      aiValidationBaseUrl: settings.aiValidationBaseUrl,
+      aiValidationApiKeyConfigured: !!settings.aiValidationApiKey.trim(),
+      aiValidationModel: settings.aiValidationModel,
       publicUrl: settings.publicUrl,
       updateChannel: settings.updateChannel,
     });

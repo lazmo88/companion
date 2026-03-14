@@ -11,9 +11,833 @@
     <meta name="apple-mobile-web-app-title" content="Companion" />
     <meta name="theme-color" content="#d97757" />
     <title>The Companion</title>
+    <style>
+      /* ── Fix: mode dropdown clipped by overflow-hidden on creation card ── */
+      .rounded-\[14px\].overflow-hidden:has(textarea) {
+        overflow: visible !important;
+      }
+      .rounded-\[14px\]:has(textarea) > textarea {
+        border-radius: 14px 14px 0 0;
+      }
+
+      /* ── Mobile: mode dropdown z-index & icon-only mode button ── */
+      @media (max-width: 640px) {
+        .rounded-\[14px\]:has(textarea) textarea {
+          font-size: 16px !important;
+        }
+        .rounded-\[14px\]:has(textarea) .absolute.bottom-full {
+          z-index: 50 !important;
+        }
+        button[data-cc-mode-injected] > span {
+          display: none !important;
+        }
+        button[data-cc-mode-injected] {
+          padding-left: 6px !important;
+          padding-right: 6px !important;
+          gap: 0 !important;
+        }
+      }
+
+      /* ── Mode dropdown for session chat ── */
+      [data-cc-mode-dropdown] {
+        position:absolute; left:0; bottom:100%; margin-bottom:4px;
+        background:var(--cc-card,#1e1e1e); border:1px solid var(--cc-border,#444);
+        border-radius:10px; box-shadow:0 4px 16px rgba(0,0,0,0.4); z-index:50;
+        min-width:160px; padding:4px 0; overflow:hidden;
+      }
+      [data-cc-mode-dropdown] button {
+        width:100%; padding:8px 14px; font-size:12px; text-align:left; border:none;
+        background:transparent; color:#ccc; cursor:pointer; transition:background 0.1s;
+      }
+      [data-cc-mode-dropdown] button:hover { background:rgba(91,168,160,0.15); }
+      [data-cc-mode-dropdown] button.current { color:#5BA8A0; font-weight:600; }
+
+      /* ── Session sort dropdown ── */
+      [data-cc-session-sort-wrap] {
+        display:inline-flex; align-items:center; gap:6px;
+        font-size:11px; color:#888;
+      }
+      [data-cc-session-sort-wrap] select {
+        background:var(--cc-card,#1e1e1e); border:1px solid var(--cc-border,#444);
+        color:#ccc; font-size:11px; padding:2px 6px; border-radius:4px;
+        cursor:pointer; outline:none; accent-color:#5BA8A0;
+      }
+      [data-cc-session-sort-wrap] select:focus {
+        border-color:#5BA8A0;
+      }
+
+      /* ── Collapsible sidebar sections ── */
+      [data-cc-collapsible] {
+        cursor: pointer;
+        user-select: none;
+      }
+      [data-cc-collapsible]::before {
+        content: '▾';
+        display: inline-block;
+        margin-right: 4px;
+        font-size: 9px;
+        transition: transform 0.15s;
+        opacity: 0.5;
+      }
+      [data-cc-collapsible].cc-collapsed::before {
+        transform: rotate(-90deg);
+      }
+      [data-cc-collapsible].cc-collapsed + div,
+      [data-cc-collapsible].cc-collapsed + ul,
+      [data-cc-collapsible].cc-collapsed + nav,
+      [data-cc-collapsible].cc-collapsed ~ a,
+      [data-cc-collapsible].cc-collapsed ~ button {
+        display: none !important;
+      }
+      .cc-section-collapsed > *:not([data-cc-collapsible]) {
+        display: none !important;
+      }
+
+      /* ── AI Validation custom settings panel ── */
+      .cc-ai-settings { margin-top: 16px; }
+      .cc-ai-settings label { display: block; margin-bottom: 12px; }
+      .cc-ai-settings .cc-field-label {
+        display: block; font-size: 13px; font-weight: 600; color: #ccc; margin-bottom: 4px;
+      }
+      .cc-ai-settings select,
+      .cc-ai-settings input[type="text"],
+      .cc-ai-settings input[type="password"] {
+        width: 100%; padding: 8px 10px; border-radius: 8px; font-size: 13px;
+        background: var(--cc-card, #1e1e1e); border: 1px solid var(--cc-border, #444);
+        color: #ccc; outline: none; box-sizing: border-box;
+      }
+      .cc-ai-settings select:focus,
+      .cc-ai-settings input:focus {
+        border-color: #5BA8A0;
+      }
+      .cc-ai-settings .cc-hint {
+        font-size: 11px; color: #666; margin-top: 2px;
+      }
+      .cc-ai-settings .cc-save-row {
+        display: flex; align-items: center; gap: 10px; margin-top: 16px;
+      }
+      .cc-ai-settings .cc-save-btn {
+        padding: 8px 20px; border-radius: 8px; border: none; cursor: pointer;
+        font-size: 13px; font-weight: 600;
+        background: #d97757; color: #fff;
+      }
+      .cc-ai-settings .cc-save-btn:hover { opacity: 0.9; }
+      .cc-ai-settings .cc-status { font-size: 12px; color: #5BA8A0; }
+
+      /* ── Copy buttons for messages and code blocks ── */
+      .cc-copy-btn {
+        position: absolute; top: 4px; right: 4px;
+        width: 28px; height: 28px; border: none; border-radius: 6px;
+        background: rgba(0,0,0,0.4); color: #aaa; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        opacity: 0; transition: opacity 0.15s;
+        z-index: 10; padding: 0;
+      }
+      .cc-copy-btn svg { width: 14px; height: 14px; }
+      .cc-copy-btn:hover { background: rgba(0,0,0,0.6); color: #fff; }
+      .cc-copy-btn.cc-copied { color: #5BA8A0; }
+      *:hover > .cc-copy-btn,
+      .cc-copy-btn:focus { opacity: 1; }
+      /* Code block copy: top-right of pre */
+      pre { position: relative; }
+      pre > .cc-copy-btn { top: 6px; right: 6px; }
+
+      /* ── Cost badge on session headers ── */
+      .cc-cost-badge {
+        display:inline-block; margin-left:6px; padding:1px 6px; border-radius:4px;
+        background:#1a2f2d; color:#5BA8A0; font-size:0.7rem; font-weight:600;
+        font-variant-numeric:tabular-nums; vertical-align:middle;
+        border:1px solid #2a4a47; cursor:default; user-select:none;
+      }
+    </style>
   </head>
   <body class="bg-cc-bg text-cc-fg">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+    /* Companion UI Enhancements — injected post-React */
+    (function() {
+      let showHidden = localStorage.getItem('cc-show-hidden') === '1';
+      function ccAuthHeaders(extra) {
+        var h = extra ? Object.assign({}, extra) : {};
+        var tok = localStorage.getItem('companion_auth_token') || '';
+        if (tok) h['Authorization'] = 'Bearer ' + tok;
+        return h;
+      }
+      const MODES = [
+        { value: 'default', label: 'Default', match: ['default'] },
+        { value: 'acceptEdits', label: 'Accept Edits', match: ['acceptedits', 'accept edits'] },
+        { value: 'bypassPermissions', label: 'Yolo', match: ['yolo', 'agent', 'bypasspermissions', 'auto'] },
+        { value: 'plan', label: 'Plan', match: ['plan'] }
+      ];
+
+      /* ── Fetch interceptor: add showHidden to /fs/list requests ── */
+      const origFetch = window.fetch;
+      window.fetch = function(url, opts) {
+        if (typeof url === 'string' && url.includes('/fs/list') && showHidden && !url.includes('showHidden')) {
+          url += (url.includes('?') ? '&' : '?') + 'showHidden=1';
+        }
+        return origFetch.call(this, url, opts);
+      };
+
+      /* ── WebSocket interceptor: track browser connections per session + cost ── */
+      const sessionSockets = {};
+      const costMap = {};
+      const OrigWS = window.WebSocket;
+      window.WebSocket = function(url, protocols) {
+        const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+        const match = typeof url === 'string' && url.match(/\/ws\/browser\/([0-9a-f-]+)/);
+        if (match) {
+          var sid = match[1];
+          sessionSockets[sid] = ws;
+          ws.addEventListener('close', () => { if (sessionSockets[sid] === ws) delete sessionSockets[sid]; });
+          /* Track cost from session_update / session_init messages */
+          ws.addEventListener('message', function(ev) {
+            try {
+              var msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
+              if (msg && (msg.type === 'session_update' || msg.type === 'session_init') && msg.session) {
+                if (typeof msg.session.total_cost_usd === 'number') {
+                  costMap[sid] = msg.session.total_cost_usd;
+                  upsertCostBadge(sid, costMap[sid]);
+                }
+              }
+            } catch(e) {}
+          });
+        }
+        return ws;
+      };
+      window.WebSocket.prototype = OrigWS.prototype;
+      window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+      window.WebSocket.OPEN = OrigWS.OPEN;
+      window.WebSocket.CLOSING = OrigWS.CLOSING;
+      window.WebSocket.CLOSED = OrigWS.CLOSED;
+
+      function sendModeChange(sessionId, mode) {
+        const ws = sessionSockets[sessionId];
+        if (ws && ws.readyState === OrigWS.OPEN) {
+          ws.send(JSON.stringify({ type: 'set_permission_mode', mode: mode, client_msg_id: 'cc-inject-' + Date.now() }));
+        }
+      }
+
+      function getCurrentSessionId() {
+        const hash = window.location.hash;
+        const m = hash.match(/#\/session\/([0-9a-f-]+)/);
+        return m ? m[1] : null;
+      }
+
+      /* ── Cost badge: inject/update on session headers ── */
+      function upsertCostBadge(sessionId, cost) {
+        /* Try session header in the chat view — look for the truncate button/span */
+        var hash = window.location.hash;
+        if (hash.indexOf(sessionId) === -1) return;
+        var headers = document.querySelectorAll('div[class*="border-b"][class*="shrink-0"] span[class*="truncate"], div[class*="border-b"][class*="shrink-0"] button[class*="truncate"]');
+        headers.forEach(function(el) {
+          var badge = el.parentElement && el.parentElement.querySelector('.cc-cost-badge');
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'cc-cost-badge';
+            badge.title = 'Session cost (USD)';
+            (el.parentElement || el).appendChild(badge);
+          }
+          badge.textContent = '$' + (cost || 0).toFixed(4);
+        });
+      }
+
+      function refreshCostBadges() {
+        var sid = getCurrentSessionId();
+        if (sid && costMap[sid] !== undefined) upsertCostBadge(sid, costMap[sid]);
+      }
+
+      /* ── Collapsible sidebar sections ── */
+      var SIDEBAR_SECTIONS = ['Workbench', 'Workspace'];
+      var _collapsedSections = JSON.parse(localStorage.getItem('cc-sidebar-collapsed') || '{}');
+      /* Default to collapsed if user has never toggled */
+      SIDEBAR_SECTIONS.forEach(function(s) { if (!(s in _collapsedSections)) _collapsedSections[s] = true; });
+
+      function injectSidebarCollapse() {
+        var nav = document.querySelector('aside, nav, [class*="sidebar"], [class*="w-64"], [class*="w-\\["], [class*="shrink-0"][class*="flex-col"]');
+        if (!nav) return;
+        /* Find section headers by their uppercase text */
+        var headings = nav.querySelectorAll('p, span, h3, h4, div');
+        for (var i = 0; i < headings.length; i++) {
+          var el = headings[i];
+          var txt = (el.textContent || '').trim();
+          if (SIDEBAR_SECTIONS.indexOf(txt) === -1) continue;
+          if (el.hasAttribute('data-cc-collapsible')) continue;
+          /* Only target direct text nodes matching the section name */
+          if (el.children.length > 1) continue;
+          el.setAttribute('data-cc-collapsible', txt);
+          if (_collapsedSections[txt]) el.classList.add('cc-collapsed');
+          /* Find the parent section container */
+          var section = el.closest('div[class*="flex"][class*="flex-col"]') || el.parentElement;
+          if (section && _collapsedSections[txt]) section.classList.add('cc-section-collapsed');
+          el.addEventListener('click', (function(heading, sectionName) {
+            return function(ev) {
+              ev.preventDefault(); ev.stopPropagation();
+              var collapsed = heading.classList.toggle('cc-collapsed');
+              var sec = heading.closest('div[class*="flex"][class*="flex-col"]') || heading.parentElement;
+              if (sec) sec.classList.toggle('cc-section-collapsed', collapsed);
+              _collapsedSections[sectionName] = collapsed;
+              localStorage.setItem('cc-sidebar-collapsed', JSON.stringify(_collapsedSections));
+            };
+          })(el, txt));
+        }
+      }
+
+      /* ── DOM Observer: enhance UI when elements appear ── */
+      const observer = new MutationObserver(() => {
+        injectFolderPickerToggle();
+        injectChatModeDropdown();
+        injectSessionSortDropdown();
+        injectSidebarCollapse();
+        refreshCostBadges();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      /* ── Folder Picker: inject "Show hidden" toggle ── */
+      function injectFolderPickerToggle() {
+        const modals = document.querySelectorAll('.fixed.inset-0.z-50');
+        for (const modal of modals) {
+          const h2 = modal.querySelector('h2');
+          if (!h2 || h2.textContent !== 'Select Folder') continue;
+          if (modal.querySelector('[data-cc-hidden-toggle]')) continue;
+          const header = h2.closest('.flex.items-center');
+          if (!header) continue;
+          const toggle = document.createElement('label');
+          toggle.setAttribute('data-cc-hidden-toggle', '1');
+          toggle.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:11px;color:#888;cursor:pointer;margin-left:auto;margin-right:8px;';
+          toggle.innerHTML = '<input type="checkbox" style="accent-color:#5BA8A0;"' + (showHidden ? ' checked' : '') + ' /> Hidden';
+          toggle.querySelector('input').addEventListener('change', function() {
+            showHidden = this.checked;
+            localStorage.setItem('cc-show-hidden', showHidden ? '1' : '0');
+            var el = modal.querySelector('h2');
+            if (!el) return;
+            var fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
+            if (!fiberKey) return;
+            var fiber = el[fiberKey];
+            while (fiber) {
+              if (typeof fiber.type === 'function' && fiber.memoizedState) {
+                var hook = fiber.memoizedState, pathVal = null, navFn = null;
+                while (hook) {
+                  var ms = hook.memoizedState;
+                  if (pathVal === null && typeof ms === 'string' && ms.length > 0) pathVal = ms;
+                  if (Array.isArray(ms) && ms.length === 2 && typeof ms[0] === 'function' && Array.isArray(ms[1])) { navFn = ms[0]; break; }
+                  hook = hook.next;
+                }
+                if (navFn && pathVal) { navFn(pathVal); return; }
+              }
+              fiber = fiber.return;
+            }
+          });
+          header.insertBefore(toggle, header.querySelector('button'));
+          /* ── "+ New Folder" button ── */
+          var nfBtn = document.createElement('button');
+          nfBtn.setAttribute('data-cc-newfolder-btn', '1');
+          nfBtn.textContent = '+ New';
+          nfBtn.style.cssText = 'background:none;border:1px solid #5BA8A0;color:#5BA8A0;font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;margin-right:8px;white-space:nowrap;';
+          nfBtn.addEventListener('click', function() {
+            var folderName = prompt('New folder name:');
+            if (!folderName || !folderName.trim()) return;
+            var el2 = modal.querySelector('h2');
+            if (!el2) return;
+            var fk = Object.keys(el2).find(function(k) { return k.startsWith('__reactFiber$'); });
+            if (!fk) return;
+            var fb = el2[fk], cPath = null, nav = null;
+            while (fb) {
+              if (typeof fb.type === 'function' && fb.memoizedState) {
+                var hk = fb.memoizedState; cPath = null; nav = null;
+                while (hk) {
+                  var ms = hk.memoizedState;
+                  if (cPath === null && typeof ms === 'string' && ms.length > 0) cPath = ms;
+                  if (Array.isArray(ms) && ms.length === 2 && typeof ms[0] === 'function' && Array.isArray(ms[1])) { nav = ms[0]; break; }
+                  hk = hk.next;
+                }
+                if (nav && cPath) break;
+              }
+              fb = fb.return;
+            }
+            if (!cPath || !nav) return;
+            var newPath = cPath + '/' + folderName.trim();
+            origFetch('/api/fs/mkdir', {
+              method: 'POST', headers: ccAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ path: newPath })
+            }).then(function(r) { return r.json(); }).then(function(data) {
+              if (data.error) { alert('Error: ' + data.error); nav(cPath); }
+              else nav(newPath);
+            }).catch(function() { alert('Failed to create folder'); nav(cPath); });
+          });
+          header.insertBefore(nfBtn, header.querySelector('button'));
+        }
+      }
+
+      /* ── Chat mode dropdown: replace toggle with full mode selector ── */
+      var _modeBtnRetryInterval = null;
+
+      function _attachModeBtnListeners(modeBtn) {
+        if (modeBtn.hasAttribute('data-cc-mode-injected')) return;
+        modeBtn.setAttribute('data-cc-mode-injected', '1');
+        var wrapper = modeBtn.parentElement;
+        if (wrapper) wrapper.style.position = 'relative';
+        modeBtn.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          ev.stopImmediatePropagation();
+          toggleModeDropdown(modeBtn);
+        }, true);
+        modeBtn.addEventListener('contextmenu', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          toggleModeDropdown(modeBtn);
+        });
+      }
+
+      function injectChatModeDropdown() {
+        var modeBtn = document.querySelector('button[title="Toggle mode (Shift+Tab)"]');
+        if (modeBtn) {
+          _attachModeBtnListeners(modeBtn);
+          /* Found it — stop any pending retry interval */
+          if (_modeBtnRetryInterval !== null) {
+            clearInterval(_modeBtnRetryInterval);
+            _modeBtnRetryInterval = null;
+          }
+          return;
+        }
+        /* Button not found yet — start a retry interval if not already running */
+        if (_modeBtnRetryInterval !== null) return;
+        var _retryCount = 0;
+        _modeBtnRetryInterval = setInterval(function() {
+          _retryCount++;
+          var btn = document.querySelector('button[title="Toggle mode (Shift+Tab)"]');
+          if (btn) {
+            _attachModeBtnListeners(btn);
+            clearInterval(_modeBtnRetryInterval);
+            _modeBtnRetryInterval = null;
+            return;
+          }
+          /* Give up after 10 seconds (20 × 500ms) */
+          if (_retryCount >= 20) {
+            clearInterval(_modeBtnRetryInterval);
+            _modeBtnRetryInterval = null;
+          }
+        }, 500);
+      }
+
+      /* ── Session sort dropdown: inject near "Refresh detected sessions" ── */
+      var _sessionSortMode = localStorage.getItem('cc-session-sort') || 'auto';
+
+      function injectSessionSortDropdown() {
+        /* Find the branch-from-session panel */
+        var panel = document.querySelector('[id="branch-from-session-panel"]');
+        if (!panel) return;
+        /* Avoid double-injecting */
+        if (panel.querySelector('[data-cc-session-sort-wrap]')) return;
+
+        /* Find a good anchor — look for "Refresh detected sessions" button */
+        var refreshBtn = null;
+        var allBtns = panel.querySelectorAll('button');
+        for (var i = 0; i < allBtns.length; i++) {
+          if (allBtns[i].textContent.trim().indexOf('Refresh') !== -1) {
+            refreshBtn = allBtns[i]; break;
+          }
+        }
+        /* Fallback: inject after the first header row we can find */
+        var anchor = refreshBtn ? refreshBtn.parentElement : null;
+        if (!anchor) {
+          /* Try to find a header-like row with "Session" text */
+          var spans = panel.querySelectorAll('span');
+          for (var j = 0; j < spans.length; j++) {
+            if (spans[j].textContent.trim() === 'Session') {
+              anchor = spans[j].closest('div');
+              break;
+            }
+          }
+        }
+        if (!anchor) return;
+
+        /* Build sort widget */
+        var wrap = document.createElement('span');
+        wrap.setAttribute('data-cc-session-sort-wrap', '1');
+        wrap.innerHTML = 'Sort: <select></select>';
+        var sel = wrap.querySelector('select');
+        var sortOptions = [
+          { value: 'auto',       label: 'Auto' },
+          { value: 'lastactive', label: 'Last Active' },
+          { value: 'name',       label: 'Name' },
+          { value: 'branch',     label: 'Branch' },
+          { value: 'project',    label: 'Project' }
+        ];
+        sortOptions.forEach(function(opt) {
+          var o = document.createElement('option');
+          o.value = opt.value;
+          o.textContent = opt.label;
+          if (opt.value === _sessionSortMode) o.selected = true;
+          sel.appendChild(o);
+        });
+
+        sel.addEventListener('change', function() {
+          _sessionSortMode = sel.value;
+          localStorage.setItem('cc-session-sort', _sessionSortMode);
+          applySessionSort(panel);
+        });
+
+        /* Append the widget right after (or inside) the anchor */
+        if (refreshBtn) {
+          /* Insert the sort widget as a sibling right after the refresh button */
+          anchor.appendChild(wrap);
+        } else {
+          anchor.appendChild(wrap);
+        }
+
+        /* Apply stored sort immediately if not auto */
+        if (_sessionSortMode !== 'auto') applySessionSort(panel);
+      }
+
+      function applySessionSort(panel) {
+        if (_sessionSortMode === 'auto') return;
+
+        /* Find session rows — they live inside a div with divide-y class */
+        var rowContainer = null;
+        var dividers = panel.querySelectorAll('div[class*="divide-y"]');
+        for (var i = 0; i < dividers.length; i++) {
+          /* A valid row container has multiple direct children that look like rows */
+          var children = dividers[i].children;
+          if (children.length > 0) { rowContainer = dividers[i]; break; }
+        }
+        if (!rowContainer) return;
+
+        var rows = Array.prototype.slice.call(rowContainer.children);
+        if (rows.length <= 1) return;
+
+        /* Determine which column index maps to our sort key.
+           Expected column order: Session(0), Project(1), Branch(2), Last active(3), Action(4) */
+        var colIndex = { name: 0, project: 1, branch: 2, lastactive: 3 }[_sessionSortMode];
+        if (colIndex === undefined) return;
+
+        rows.sort(function(a, b) {
+          var cellsA = a.querySelectorAll(':scope > div, :scope > span, :scope > td');
+          var cellsB = b.querySelectorAll(':scope > div, :scope > span, :scope > td');
+
+          /* Fallback: use all direct children */
+          if (cellsA.length === 0) cellsA = a.children;
+          if (cellsB.length === 0) cellsB = b.children;
+
+          var txtA = cellsA[colIndex] ? cellsA[colIndex].textContent.trim() : '';
+          var txtB = cellsB[colIndex] ? cellsB[colIndex].textContent.trim() : '';
+
+          if (_sessionSortMode === 'lastactive') {
+            /* Sort descending (most recent first) — treat as string, ISO-like dates sort correctly */
+            return txtB.localeCompare(txtA);
+          }
+          return txtA.localeCompare(txtB, undefined, { sensitivity: 'base' });
+        });
+
+        /* Re-append rows in new order (DOM move, no clone) */
+        rows.forEach(function(row) { rowContainer.appendChild(row); });
+      }
+
+      function toggleModeDropdown(modeBtn) {
+        let dropdown = document.querySelector('[data-cc-mode-dropdown]');
+        if (dropdown) { dropdown.remove(); return; }
+
+        const sessionId = getCurrentSessionId();
+        if (!sessionId) return;
+
+        const currentLabel = (modeBtn.querySelector('span') || {}).textContent || '';
+
+        dropdown = document.createElement('div');
+        dropdown.setAttribute('data-cc-mode-dropdown', '1');
+        MODES.forEach(function(m) {
+          const btn = document.createElement('button');
+          btn.textContent = m.label;
+          if (m.match && m.match.some(function(x) { return x === currentLabel.toLowerCase(); })) btn.classList.add('current');
+          btn.addEventListener('click', function(ev) {
+            ev.preventDefault(); ev.stopPropagation();
+            sendModeChange(sessionId, m.value);
+            const span = modeBtn.querySelector('span');
+            if (span) span.textContent = m.label.toLowerCase();
+            dropdown.remove();
+          });
+          dropdown.appendChild(btn);
+        });
+
+        (modeBtn.parentElement || modeBtn).appendChild(dropdown);
+
+        setTimeout(function() {
+          function closeDropdown(ev) {
+            if (!dropdown.contains(ev.target)) { dropdown.remove(); document.removeEventListener('pointerdown', closeDropdown); }
+          }
+          document.addEventListener('pointerdown', closeDropdown);
+        }, 10);
+      }
+
+      /* ── Per-session draft message storage ── */
+      var DRAFT_PREFIX = 'cc-draft-';
+      var lastDraftSessionId = null;
+      var nativeTextareaSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+
+      function getSessionTextarea() {
+        return document.querySelector('div[class*="rounded-\\[14px\\]"]:has(button[data-cc-mode-injected]) textarea');
+      }
+
+      function saveDraft() {
+        if (!lastDraftSessionId) return;
+        var ta = getSessionTextarea();
+        if (ta) {
+          var val = ta.value || '';
+          if (val.trim()) {
+            localStorage.setItem(DRAFT_PREFIX + lastDraftSessionId, val);
+          } else {
+            localStorage.removeItem(DRAFT_PREFIX + lastDraftSessionId);
+          }
+        }
+      }
+
+      function restoreDraft(sessionId) {
+        if (!sessionId) return;
+        var ta = getSessionTextarea();
+        if (!ta) return;
+        var draft = localStorage.getItem(DRAFT_PREFIX + sessionId) || '';
+        nativeTextareaSetter.call(ta, draft);
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+      }
+
+      function checkSessionChange() {
+        var currentId = getCurrentSessionId();
+        if (currentId && currentId !== lastDraftSessionId) {
+          saveDraft();
+          lastDraftSessionId = currentId;
+          setTimeout(function() { restoreDraft(currentId); }, 100);
+        }
+      }
+
+      window.addEventListener('hashchange', checkSessionChange);
+      window.addEventListener('beforeunload', saveDraft);
+      setInterval(function() {
+        var id = getCurrentSessionId();
+        if (id && !lastDraftSessionId) { lastDraftSessionId = id; }
+      }, 500);
+
+      /* ── Session rename via header click ── */
+      function injectSessionRename() {
+        var header = document.querySelector('div[class*="shrink-0"][class*="border-b"] button[class*="truncate"]');
+        if (!header) {
+          var topBars = document.querySelectorAll('div[class*="border-b"][class*="shrink-0"]');
+          for (var i = 0; i < topBars.length; i++) {
+            var h = topBars[i].querySelector('h1, span[class*="font-semibold"][class*="truncate"]');
+            if (h && h.textContent && !h.hasAttribute('data-cc-rename')) {
+              h.setAttribute('data-cc-rename', '1');
+              h.style.cursor = 'pointer';
+              h.title = 'Click to rename session';
+              h.addEventListener('dblclick', function(ev) {
+                ev.preventDefault();
+                var sid = getCurrentSessionId();
+                if (!sid) return;
+                var currentName = this.textContent.trim();
+                var newName = prompt('Rename session:', currentName);
+                if (newName && newName.trim() && newName.trim() !== currentName) {
+                  origFetch('/api/sessions/' + encodeURIComponent(sid) + '/name', {
+                    method: 'PATCH',
+                    headers: ccAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({ name: newName.trim() })
+                  }).then(function(r) { return r.json(); }).then(function(data) {
+                    if (!data.error) {
+                      ev.target.textContent = newName.trim();
+                    }
+                  }).catch(function() {});
+                }
+              });
+            }
+          }
+        }
+      }
+
+      var renameObserver = new MutationObserver(injectSessionRename);
+      renameObserver.observe(document.body, { childList: true, subtree: true });
+
+      /* ── AI Validation settings injection ── */
+      function injectAiValidationSettings() {
+        /* Find the AI Validation section on Settings page */
+        var headings = document.querySelectorAll('h2, h3');
+        var aiHeading = null;
+        for (var i = 0; i < headings.length; i++) {
+          if ((headings[i].textContent || '').trim() === 'AI Validation') { aiHeading = headings[i]; break; }
+        }
+        if (!aiHeading) return;
+        var section = aiHeading.closest('div');
+        if (!section || section.querySelector('.cc-ai-settings')) return;
+
+        /* Hide the "Configure an Anthropic API key" warning if present */
+        var allEls = section.querySelectorAll('p, span, div');
+        for (var j = 0; j < allEls.length; j++) {
+          var txt = (allEls[j].textContent || '').trim();
+          if (txt.indexOf('Configure an Anthropic API key') !== -1) {
+            allEls[j].style.display = 'none';
+          }
+        }
+
+        var panel = document.createElement('div');
+        panel.className = 'cc-ai-settings';
+        panel.innerHTML = '' +
+          '<label>' +
+            '<span class="cc-field-label">Provider</span>' +
+            '<select id="cc-ai-provider">' +
+              '<option value="anthropic">Anthropic</option>' +
+              '<option value="openai">OpenAI-compatible</option>' +
+              '<option value="custom">Custom endpoint</option>' +
+            '</select>' +
+          '</label>' +
+          '<label>' +
+            '<span class="cc-field-label">Base URL</span>' +
+            '<input type="text" id="cc-ai-baseurl" placeholder="https://api.example.com/v1/chat/completions" />' +
+            '<div class="cc-hint">For OpenAI-compatible: LiteLLM, Ollama, vLLM, etc. Leave empty for default.</div>' +
+          '</label>' +
+          '<label>' +
+            '<span class="cc-field-label">API Key</span>' +
+            '<input type="password" id="cc-ai-apikey" placeholder="API key (leave empty if not required)" />' +
+            '<div class="cc-hint">Stored server-side. Shows as configured/not configured.</div>' +
+          '</label>' +
+          '<label>' +
+            '<span class="cc-field-label">Model</span>' +
+            '<input type="text" id="cc-ai-model" placeholder="e.g. claude-haiku-4-5-20251001, gpt-4o-mini" />' +
+            '<div class="cc-hint">Model name for AI validation requests.</div>' +
+          '</label>' +
+          '<div class="cc-save-row">' +
+            '<button class="cc-save-btn" id="cc-ai-save">Save</button>' +
+            '<span class="cc-status" id="cc-ai-status"></span>' +
+          '</div>';
+        section.appendChild(panel);
+
+        /* Load current settings */
+        var headers = ccAuthHeaders({ 'Content-Type': 'application/json' });
+
+        origFetch('/api/settings', { headers: headers })
+          .then(function(r) { return r.json(); })
+          .then(function(s) {
+            document.getElementById('cc-ai-provider').value = s.aiValidationProvider || 'anthropic';
+            document.getElementById('cc-ai-baseurl').value = s.aiValidationBaseUrl || '';
+            document.getElementById('cc-ai-model').value = s.aiValidationModel || '';
+            if (s.aiValidationApiKeyConfigured) {
+              document.getElementById('cc-ai-apikey').placeholder = 'Configured (enter new value to change)';
+            }
+          }).catch(function() {});
+
+        /* Save handler */
+        document.getElementById('cc-ai-save').addEventListener('click', function() {
+          var payload = {
+            aiValidationProvider: document.getElementById('cc-ai-provider').value,
+            aiValidationBaseUrl: document.getElementById('cc-ai-baseurl').value,
+            aiValidationModel: document.getElementById('cc-ai-model').value
+          };
+          var apiKey = document.getElementById('cc-ai-apikey').value;
+          if (apiKey) payload.aiValidationApiKey = apiKey;
+
+          origFetch('/api/settings', {
+            method: 'PUT',
+            headers: headers,
+            body: JSON.stringify(payload)
+          }).then(function(r) { return r.json(); })
+            .then(function(data) {
+              if (data.error) {
+                document.getElementById('cc-ai-status').textContent = 'Error: ' + data.error;
+                document.getElementById('cc-ai-status').style.color = '#ff6b6b';
+              } else {
+                document.getElementById('cc-ai-status').textContent = 'Saved!';
+                document.getElementById('cc-ai-status').style.color = '#5BA8A0';
+                if (apiKey) {
+                  document.getElementById('cc-ai-apikey').value = '';
+                  document.getElementById('cc-ai-apikey').placeholder = 'Configured (enter new value to change)';
+                }
+                setTimeout(function() { document.getElementById('cc-ai-status').textContent = ''; }, 2000);
+              }
+            }).catch(function() {
+              document.getElementById('cc-ai-status').textContent = 'Network error';
+              document.getElementById('cc-ai-status').style.color = '#ff6b6b';
+            });
+        });
+      }
+
+      /* Hook into settings page visibility via MutationObserver */
+      var settingsObserver = new MutationObserver(function() {
+        injectAiValidationSettings();
+      });
+      settingsObserver.observe(document.body, { childList: true, subtree: true });
+
+      /* ── Copy buttons for messages and code blocks ── */
+      var COPY_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="8" height="8" rx="1.5"/><path d="M3 11V3.5A1.5 1.5 0 014.5 2H11"/></svg>';
+      var CHECK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8.5l3.5 3.5 6.5-7"/></svg>';
+
+      function createCopyBtn(getText) {
+        var btn = document.createElement('button');
+        btn.className = 'cc-copy-btn';
+        btn.innerHTML = COPY_SVG;
+        btn.title = 'Copy';
+        btn.addEventListener('click', function(ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          var text = getText();
+          if (!text) return;
+          navigator.clipboard.writeText(text).then(function() {
+            btn.innerHTML = CHECK_SVG;
+            btn.classList.add('cc-copied');
+            setTimeout(function() { btn.innerHTML = COPY_SVG; btn.classList.remove('cc-copied'); }, 1500);
+          });
+        });
+        return btn;
+      }
+
+      function injectCopyButtons() {
+        /* Code blocks: pre elements with code-bg class */
+        var codeBlocks = document.querySelectorAll('pre[class*="bg-cc-code"]');
+        for (var i = 0; i < codeBlocks.length; i++) {
+          var pre = codeBlocks[i];
+          if (pre.querySelector('.cc-copy-btn')) continue;
+          pre.appendChild(createCopyBtn((function(el) {
+            return function() { return el.textContent || ''; };
+          })(pre)));
+        }
+
+        /* User message bubbles */
+        var userBubbles = document.querySelectorAll('div[class*="bg-cc-user-bubble"]');
+        for (var j = 0; j < userBubbles.length; j++) {
+          var bubble = userBubbles[j];
+          if (bubble.querySelector('.cc-copy-btn')) continue;
+          bubble.style.position = 'relative';
+          bubble.appendChild(createCopyBtn((function(el) {
+            return function() { return el.textContent || ''; };
+          })(bubble)));
+        }
+
+        /* Assistant message content — look for the border-l-2 content area */
+        var assistantBlocks = document.querySelectorAll('div[class*="border-l-2"][class*="border-cc-primary"]');
+        for (var k = 0; k < assistantBlocks.length; k++) {
+          var block = assistantBlocks[k];
+          if (block.querySelector(':scope > .cc-copy-btn')) continue;
+          block.style.position = 'relative';
+          block.appendChild(createCopyBtn((function(el) {
+            return function() {
+              /* Extract text, skipping tool use blocks and buttons */
+              var texts = [];
+              var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+              while (walker.nextNode()) {
+                var node = walker.currentNode;
+                var parent = node.parentElement;
+                if (parent && (parent.closest('button') || parent.closest('[class*="cc-copy-btn"]'))) continue;
+                var t = node.textContent.trim();
+                if (t) texts.push(t);
+              }
+              return texts.join('\n');
+            };
+          })(block)));
+        }
+      }
+
+      /* Add to main observer */
+      var copyObserver = new MutationObserver(injectCopyButtons);
+      copyObserver.observe(document.body, { childList: true, subtree: true });
+
+      showHidden = localStorage.getItem('cc-show-hidden') === '1';
+    })();
+    </script>
   </body>
 </html>
